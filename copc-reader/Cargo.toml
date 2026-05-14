@@ -1,0 +1,19 @@
+[package]
+name = "copc-reader"
+description = "Pure-Rust COPC reader with public hierarchy access"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/copc-reader"
+keywords = ["copc", "las", "laz", "point-cloud", "gis"]
+categories = ["science", "parser-implementations"]
+
+[dependencies]
+byteorder = { workspace = true }
+copc-core = { version = "0.1.0", path = "../copc-core" }
+las = { workspace = true }
+thiserror = { workspace = true }
