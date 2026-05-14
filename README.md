@@ -11,89 +11,45 @@ Pure-Rust COPC reader, writer, and shared core primitives for cloud-optimized
 point clouds. No C libraries, no build scripts; internal unsafe is limited to
 read-only memory mapping of writer spill files.
 
-## Design Priorities
-
-- Public hierarchy data model: `CopcInfo`, `HierarchyPage`, `Entry`, and
-  `VoxelKey` are exposed for availability, indexing, and tile-serving workflows.
-- Out-of-core conversion: LAS/LAZ records can stream through an explicit
-  little-endian spill file instead of requiring a materialized point cloud.
-- Container-neutral writing: `CopcPointSource` lets callers keep their own point
-  storage while sharing the COPC hierarchy and LAZ emission path.
-- Native LOD output: the writer places representative points in interior octree
-  nodes so coarse-LOD reads are useful, not only full-resolution leaf reads.
-
 ## Crates
 
 | Crate | Description |
 |---|---|
 | `copc-core` | Shared COPC metadata, hierarchy entries, voxel keys, bounds, streaming LAS records, and errors |
 | `copc-reader` | COPC header, info VLR, and hierarchy parsing with public hierarchy access |
-| `copc-writer` | COPC writer with LOD node distribution, source-trait point access, mmap spill support, and streaming LAS/LAZ intake |
+| `copc-writer` | COPC writer with source-trait point access, native LOD distribution, mmap spill support, and streaming LAS/LAZ intake |
 
-## Reading
+## Usage
 
 ```rust
 use copc_reader::CopcFile;
 
 let file = CopcFile::open("cloud.copc.laz")?;
-println!("points: {}", file.header().number_of_points);
-println!("root hierarchy bytes: {}", file.copc_info().root_hier_size);
-
 for entry in file.hierarchy_walk() {
     println!("{:?} points={}", entry.key, entry.point_count);
 }
 ```
 
-## Writing
-
 ```rust
-use copc_core::Bounds;
-use copc_writer::{write_source, CopcPointFields, CopcPointSource, CopcWriterParams};
+use copc_writer::{convert_las_to_copc_streaming, CopcWriterParams};
 
-struct Source {
-    points: Vec<CopcPointFields>,
-}
-
-impl CopcPointSource for Source {
-    fn len(&self) -> usize {
-        self.points.len()
-    }
-
-    fn xyz(&self, index: usize) -> (f64, f64, f64) {
-        let p = self.points[index];
-        (p.x, p.y, p.z)
-    }
-
-    fn fields(&self, index: usize) -> copc_core::Result<CopcPointFields> {
-        Ok(self.points[index])
-    }
-}
-
-let source = Source { points };
-write_source(
-    "out.copc.laz".as_ref(),
-    &source,
-    false,
-    Bounds::new((0.0, 0.0, 0.0), (100.0, 100.0, 30.0)),
+convert_las_to_copc_streaming(
+    "input.laz".as_ref(),
+    "output.copc.laz".as_ref(),
     &CopcWriterParams::default(),
+    std::env::temp_dir().as_ref(),
+    &copc_core::NeverCancel,
 )?;
 ```
 
-For out-of-core LAS/LAZ conversion, use `convert_las_to_copc_streaming()`.
-The converter spills full-fidelity LAS records to an explicit little-endian
-temporary file and memory maps that file while building the COPC hierarchy and
-LAZ chunks.
-
 ## Supported Now
 
-- Public COPC core types: `CopcInfo`, `HierarchyPage`, `Entry`, and `VoxelKey`
-- COPC info VLR and root hierarchy EVLR parse/serialize helpers
-- LAS point-format-aware streaming record layout and explicit little-endian
-  record serialization
-- Source-trait COPC writer for caller-owned point storage
+- Public COPC hierarchy types for availability, indexing, and tile serving
+- COPC info VLR and root hierarchy EVLR parsing
+- Source-trait writer API for caller-owned point storage
 - Streaming LAS/LAZ-to-COPC conversion through a disk-backed mmap spill
-- COPC writer output with LAS 1.4 point formats 6 and 7, LAZ variable-size
-  chunks, COPC info VLR, and hierarchy EVLR
+- LAS 1.4 point formats 6 and 7 with LAZ variable-size chunks
+- Interior-node representative points for native LOD reads
 
 ## Not Yet Supported
 
@@ -101,10 +57,6 @@ LAZ chunks.
 - Recursive child hierarchy page loading beyond the root page
 - Bounds/LOD-selected reader point iteration
 - Materialized point-column convenience APIs
-
-COPC is sparse point data rather than a dense grid. The primary API is
-streaming/chunk/hierarchy-first; any future `ndarray` convenience should be an
-optional materialization layer, not a core dependency.
 
 ## Testing
 
