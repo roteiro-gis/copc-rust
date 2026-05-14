@@ -1,5 +1,5 @@
 [workspace]
-members = ["copc-core"]
+members = ["copc-core", "copc-reader"]
 resolver = "2"
 
 [workspace.package]
@@ -11,5 +11,6 @@ repository = "https://github.com/roteiro-gis/copc-rust"
 homepage = "https://github.com/roteiro-gis/copc-rust"
 
 [workspace.dependencies]
+byteorder = "1"
 las = { version = "0.8", features = ["laz"] }
 thiserror = "2"
