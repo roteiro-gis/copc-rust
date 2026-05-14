@@ -1,0 +1,15 @@
+[workspace]
+members = ["copc-core"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/roteiro-gis/copc-rust"
+homepage = "https://github.com/roteiro-gis/copc-rust"
+
+[workspace.dependencies]
+las = { version = "0.8", features = ["laz"] }
+thiserror = "2"
