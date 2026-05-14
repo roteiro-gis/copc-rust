@@ -1,0 +1,17 @@
+[package]
+name = "copc-core"
+description = "Shared COPC metadata, hierarchy, streaming point, and error types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/copc-core"
+keywords = ["copc", "las", "laz", "point-cloud", "gis"]
+categories = ["science", "data-structures"]
+
+[dependencies]
+las = { workspace = true }
+thiserror = { workspace = true }
