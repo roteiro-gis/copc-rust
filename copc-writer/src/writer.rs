@@ -537,7 +537,7 @@ impl LasHeader {
             .write_u8(4)
             .map_err(|e| Error::io("write version minor", e))?;
         writer
-            .write_all(&pad(b"Roteiro", 32))
+            .write_all(&pad(b"copc-rust", 32))
             .map_err(|e| Error::io("write system id", e))?;
         writer
             .write_all(&pad(b"copc-writer", 32))

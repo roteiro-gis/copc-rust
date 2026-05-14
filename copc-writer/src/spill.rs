@@ -33,7 +33,7 @@ impl SpillWriter {
             .unwrap_or(0);
         let sequence = SPILL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let name = format!(
-            ".roteiro-copc-spill.{}.{}.{}.part",
+            ".copc-writer-spill.{}.{}.{}.part",
             std::process::id(),
             nanos,
             sequence

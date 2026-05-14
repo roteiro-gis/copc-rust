@@ -16,4 +16,3 @@ categories = ["science", "parser-implementations"]
 byteorder = { workspace = true }
 copc-core = { version = "0.1.0", path = "../copc-core" }
 las = { workspace = true }
-thiserror = { workspace = true }

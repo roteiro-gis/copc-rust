@@ -85,7 +85,6 @@ dependencies = [
  "byteorder",
  "copc-core",
  "las",
- "thiserror 2.0.18",
 ]
 
 [[package]]

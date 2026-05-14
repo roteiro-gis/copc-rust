@@ -1,9 +1,10 @@
 //! Pure-Rust COPC reader.
 //!
-//! This crate owns the public COPC hierarchy model used by Roteiro. The
-//! initial implementation parses LAS/COPC headers, the COPC info VLR, and
-//! the root hierarchy EVLR. Chunked-LAZ point iteration will be layered on
-//! top of the same parsed metadata.
+//! The initial implementation parses LAS/COPC headers, the COPC info VLR, and
+//! the root hierarchy EVLR. Chunked-LAZ point iteration will be layered on top
+//! of the same parsed metadata.
+
+#![forbid(unsafe_code)]
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
