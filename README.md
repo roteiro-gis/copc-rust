@@ -11,6 +11,17 @@ Pure-Rust COPC reader, writer, and shared core primitives for cloud-optimized
 point clouds. No C libraries, no build scripts; internal unsafe is limited to
 read-only memory mapping of writer spill files.
 
+## Design Priorities
+
+- Public hierarchy data model: `CopcInfo`, `HierarchyPage`, `Entry`, and
+  `VoxelKey` are exposed for availability, indexing, and tile-serving workflows.
+- Out-of-core conversion: LAS/LAZ records can stream through an explicit
+  little-endian spill file instead of requiring a materialized point cloud.
+- Container-neutral writing: `CopcPointSource` lets callers keep their own point
+  storage while sharing the COPC hierarchy and LAZ emission path.
+- Native LOD output: the writer places representative points in interior octree
+  nodes so coarse-LOD reads are useful, not only full-resolution leaf reads.
+
 ## Crates
 
 | Crate | Description |
