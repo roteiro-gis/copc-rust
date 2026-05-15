@@ -75,6 +75,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+External PDAL/QGIS COPC fixtures can be validated by placing small `.copc.laz`
+files under `copc-reader/tests/fixtures/external/{pdal,qgis}` and running:
+
+```sh
+cargo test -p copc-reader --test external_fixtures -- --ignored
+```
+
 ## License
 
 MIT OR Apache-2.0
