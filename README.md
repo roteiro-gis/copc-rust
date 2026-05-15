@@ -75,6 +75,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Checked-in external COPC fixtures from PDAL and QGIS are exercised by:
+
+```sh
+cargo test -p copc-reader --test external_fixtures
+```
+
 ## License
 
 MIT OR Apache-2.0
