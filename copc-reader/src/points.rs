@@ -329,7 +329,7 @@ fn select_point_chunks(file: &CopcFile, query: PointQuery) -> Result<Vec<Entry>>
 
     let mut chunks = Vec::new();
     for entry in file.hierarchy_entries() {
-        if entry.point_count <= 0 {
+        if !entry.has_point_data() {
             continue;
         }
         if entry.byte_size <= 0 {

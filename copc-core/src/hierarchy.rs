@@ -40,7 +40,43 @@ pub struct Entry {
     pub point_count: i32,
 }
 
+/// Availability represented by a COPC hierarchy entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryAvailability {
+    Empty,
+    PointData { point_count: u32 },
+    ChildPage,
+}
+
 impl Entry {
+    pub fn availability(self) -> Result<EntryAvailability> {
+        match self.point_count {
+            -1 => Ok(EntryAvailability::ChildPage),
+            0 => Ok(EntryAvailability::Empty),
+            count if count > 0 => {
+                let point_count = u32::try_from(count).map_err(|_| {
+                    Error::InvalidData(format!(
+                        "hierarchy entry {:?} point count {} is out of range",
+                        self.key, self.point_count
+                    ))
+                })?;
+                Ok(EntryAvailability::PointData { point_count })
+            }
+            _ => Err(Error::InvalidData(format!(
+                "hierarchy entry {:?} has invalid point count {}",
+                self.key, self.point_count
+            ))),
+        }
+    }
+
+    pub fn has_point_data(self) -> bool {
+        self.point_count > 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.point_count == 0
+    }
+
     pub fn is_child_page(self) -> bool {
         self.point_count == -1
     }
@@ -166,6 +202,44 @@ mod tests {
                 y: 0,
                 z: 1,
             }
+        );
+    }
+
+    #[test]
+    fn entry_availability_classifies_point_count() {
+        let key = VoxelKey::root();
+        assert_eq!(
+            Entry {
+                key,
+                offset: 0,
+                byte_size: 0,
+                point_count: 0
+            }
+            .availability()
+            .unwrap(),
+            EntryAvailability::Empty
+        );
+        assert_eq!(
+            Entry {
+                key,
+                offset: 64,
+                byte_size: 128,
+                point_count: 42
+            }
+            .availability()
+            .unwrap(),
+            EntryAvailability::PointData { point_count: 42 }
+        );
+        assert_eq!(
+            Entry {
+                key,
+                offset: 64,
+                byte_size: 128,
+                point_count: -1
+            }
+            .availability()
+            .unwrap(),
+            EntryAvailability::ChildPage
         );
     }
 }
