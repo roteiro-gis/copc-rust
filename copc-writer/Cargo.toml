@@ -21,4 +21,4 @@ memmap2 = { workspace = true }
 
 [dev-dependencies]
 copc-reader = { version = "0.1.0", path = "../copc-reader" }
-tempfile = "3"
+tempfile = { version = "3", default-features = false }
