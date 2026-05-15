@@ -71,4 +71,22 @@ impl Bounds {
             max: (max_x, max_y, max_z),
         }
     }
+
+    pub fn intersects(self, other: Self) -> bool {
+        self.max.0 >= other.min.0
+            && self.min.0 <= other.max.0
+            && self.max.1 >= other.min.1
+            && self.min.1 <= other.max.1
+            && self.max.2 >= other.min.2
+            && self.min.2 <= other.max.2
+    }
+
+    pub fn contains_xyz(self, x: f64, y: f64, z: f64) -> bool {
+        self.min.0 <= x
+            && x <= self.max.0
+            && self.min.1 <= y
+            && y <= self.max.1
+            && self.min.2 <= z
+            && z <= self.max.2
+    }
 }

@@ -1,17 +1,23 @@
 //! Pure-Rust COPC reader.
 //!
-//! The initial implementation parses LAS/COPC headers, the COPC info VLR, and
-//! the root hierarchy EVLR. Chunked-LAZ point iteration will be layered on top
-//! of the same parsed metadata.
+//! Parses LAS/COPC metadata and exposes chunked-LAZ point iteration over COPC
+//! hierarchy entries.
 
 #![forbid(unsafe_code)]
 
+mod points;
+
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use copc_core::{CopcInfo, Entry, Error, HierarchyPage, Result};
+use copc_core::{CopcInfo, Entry, Error, HierarchyPage, Result, VoxelKey};
+use las::{Transform, Vector};
+use laz::LazVlr;
+
+pub use points::{BoundsSelection, CopcReader, LodSelection, PointIter, PointQuery};
 
 const LAS_HEADER_SIZE_14: u16 = 375;
 /// A parsed COPC file.
@@ -19,7 +25,9 @@ const LAS_HEADER_SIZE_14: u16 = 375;
 pub struct CopcFile {
     header: LasHeader,
     copc_info: CopcInfo,
+    laszip_vlr: LazVlr,
     root_hierarchy: HierarchyPage,
+    hierarchy: BTreeMap<VoxelKey, Entry>,
 }
 
 /// Minimal LAS header fields needed by COPC callers.
@@ -29,6 +37,12 @@ pub struct LasHeader {
     pub point_data_record_length: u16,
     pub offset_to_point_data: u32,
     pub number_of_vlrs: u32,
+    pub x_scale_factor: f64,
+    pub y_scale_factor: f64,
+    pub z_scale_factor: f64,
+    pub x_offset: f64,
+    pub y_offset: f64,
+    pub z_offset: f64,
     pub min_x: f64,
     pub max_x: f64,
     pub min_y: f64,
@@ -68,6 +82,14 @@ impl CopcFile {
             .find(|vlr| vlr.user_id == "copc" && vlr.record_id == 1)
             .ok_or_else(|| Error::InvalidData("missing COPC info VLR".into()))?;
         let copc_info = CopcInfo::from_le_bytes(&copc_info_vlr.data)?;
+        let laszip_vlr = vlrs
+            .iter()
+            .find(|vlr| vlr.user_id == "laszip encoded" && vlr.record_id == 22204)
+            .map(|vlr| {
+                LazVlr::read_from(vlr.data.as_slice()).map_err(|e| Error::Las(e.to_string()))
+            })
+            .transpose()?
+            .ok_or_else(|| Error::InvalidData("missing LASzip VLR".into()))?;
         let evlrs = read_evlr_refs(reader, &header)?;
         let root_evlr = evlrs
             .iter()
@@ -80,20 +102,18 @@ impl CopcFile {
                 copc_info.root_hier_offset, root_evlr.data_offset
             )));
         }
-        let hierarchy_len = usize::try_from(copc_info.root_hier_size)
-            .map_err(|_| Error::InvalidData("root hierarchy is too large".into()))?;
-        let mut hierarchy_bytes = vec![0u8; hierarchy_len];
-        reader
-            .seek(SeekFrom::Start(copc_info.root_hier_offset))
-            .map_err(|e| Error::io("seek root hierarchy", e))?;
-        reader
-            .read_exact(&mut hierarchy_bytes)
-            .map_err(|e| Error::io("read root hierarchy", e))?;
-        let root_hierarchy = HierarchyPage::from_le_bytes(&hierarchy_bytes)?;
+        let root_hierarchy =
+            read_hierarchy_page_at(reader, copc_info.root_hier_offset, copc_info.root_hier_size)?;
+        let mut hierarchy = BTreeMap::new();
+        let mut visited_pages = HashSet::new();
+        visited_pages.insert((copc_info.root_hier_offset, copc_info.root_hier_size));
+        insert_hierarchy_page(reader, &root_hierarchy, &mut hierarchy, &mut visited_pages)?;
         Ok(Self {
             header,
             copc_info,
+            laszip_vlr,
             root_hierarchy,
+            hierarchy,
         })
     }
 
@@ -109,13 +129,104 @@ impl CopcFile {
         &self.root_hierarchy
     }
 
-    /// Return the currently parsed hierarchy entries.
-    ///
-    /// This initial implementation returns the root hierarchy page. Recursive
-    /// child-page loading belongs with the chunked-LAZ reader work.
+    /// Return all parsed hierarchy entries, including recursively loaded child pages.
     pub fn hierarchy_walk(&self) -> Vec<Entry> {
-        self.root_hierarchy.entries().to_vec()
+        self.hierarchy.values().copied().collect()
     }
+
+    pub fn hierarchy_entries(&self) -> impl Iterator<Item = &Entry> {
+        self.hierarchy.values()
+    }
+
+    pub(crate) fn laszip_vlr(&self) -> &LazVlr {
+        &self.laszip_vlr
+    }
+
+    pub(crate) fn point_format(&self) -> Result<las::point::Format> {
+        let mut format = las::point::Format::new(self.header.point_data_record_format)
+            .map_err(|e| Error::Las(e.to_string()))?;
+        let base_len = format.len();
+        if self.header.point_data_record_length < base_len {
+            return Err(Error::InvalidData(format!(
+                "point record length {} is smaller than point format {} base length {}",
+                self.header.point_data_record_length,
+                self.header.point_data_record_format,
+                base_len
+            )));
+        }
+        format.extra_bytes = self.header.point_data_record_length - base_len;
+        Ok(format)
+    }
+
+    pub(crate) fn transforms(&self) -> Vector<Transform> {
+        Vector {
+            x: Transform {
+                scale: self.header.x_scale_factor,
+                offset: self.header.x_offset,
+            },
+            y: Transform {
+                scale: self.header.y_scale_factor,
+                offset: self.header.y_offset,
+            },
+            z: Transform {
+                scale: self.header.z_scale_factor,
+                offset: self.header.z_offset,
+            },
+        }
+    }
+}
+
+impl LasHeader {
+    pub fn number_of_points(&self) -> u64 {
+        self.number_of_points
+    }
+}
+
+fn read_hierarchy_page_at<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    byte_size: u64,
+) -> Result<HierarchyPage> {
+    let hierarchy_len = usize::try_from(byte_size)
+        .map_err(|_| Error::InvalidData("hierarchy page is too large".into()))?;
+    let mut hierarchy_bytes = vec![0u8; hierarchy_len];
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(|e| Error::io("seek hierarchy page", e))?;
+    reader
+        .read_exact(&mut hierarchy_bytes)
+        .map_err(|e| Error::io("read hierarchy page", e))?;
+    HierarchyPage::from_le_bytes(&hierarchy_bytes)
+}
+
+fn insert_hierarchy_page<R: Read + Seek>(
+    reader: &mut R,
+    page: &HierarchyPage,
+    hierarchy: &mut BTreeMap<VoxelKey, Entry>,
+    visited_pages: &mut HashSet<(u64, u64)>,
+) -> Result<()> {
+    for entry in page.entries().iter().copied() {
+        hierarchy.insert(entry.key, entry);
+    }
+    for entry in page.entries().iter().copied().filter(|e| e.is_child_page()) {
+        if entry.byte_size <= 0 {
+            return Err(Error::InvalidData(format!(
+                "child hierarchy page {:?} has invalid byte size {}",
+                entry.key, entry.byte_size
+            )));
+        }
+        let byte_size = u64::try_from(entry.byte_size).map_err(|_| {
+            Error::InvalidData(format!(
+                "child hierarchy page {:?} has negative byte size {}",
+                entry.key, entry.byte_size
+            ))
+        })?;
+        if visited_pages.insert((entry.offset, byte_size)) {
+            let child_page = read_hierarchy_page_at(reader, entry.offset, byte_size)?;
+            insert_hierarchy_page(reader, &child_page, hierarchy, visited_pages)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_las_header<R: Read + Seek>(reader: &mut R) -> Result<LasHeader> {
@@ -153,8 +264,26 @@ fn read_las_header<R: Read + Seek>(reader: &mut R) -> Result<LasHeader> {
         .read_u16::<LittleEndian>()
         .map_err(|e| Error::io("read point record length", e))?;
     reader
-        .seek(SeekFrom::Start(179))
-        .map_err(|e| Error::io("seek LAS bounds", e))?;
+        .seek(SeekFrom::Start(131))
+        .map_err(|e| Error::io("seek LAS transforms", e))?;
+    let x_scale_factor = reader
+        .read_f64::<LittleEndian>()
+        .map_err(|e| Error::io("read x scale factor", e))?;
+    let y_scale_factor = reader
+        .read_f64::<LittleEndian>()
+        .map_err(|e| Error::io("read y scale factor", e))?;
+    let z_scale_factor = reader
+        .read_f64::<LittleEndian>()
+        .map_err(|e| Error::io("read z scale factor", e))?;
+    let x_offset = reader
+        .read_f64::<LittleEndian>()
+        .map_err(|e| Error::io("read x offset", e))?;
+    let y_offset = reader
+        .read_f64::<LittleEndian>()
+        .map_err(|e| Error::io("read y offset", e))?;
+    let z_offset = reader
+        .read_f64::<LittleEndian>()
+        .map_err(|e| Error::io("read z offset", e))?;
     let max_x = reader
         .read_f64::<LittleEndian>()
         .map_err(|e| Error::io("read max x", e))?;
@@ -193,6 +322,12 @@ fn read_las_header<R: Read + Seek>(reader: &mut R) -> Result<LasHeader> {
         point_data_record_length,
         offset_to_point_data,
         number_of_vlrs,
+        x_scale_factor,
+        y_scale_factor,
+        z_scale_factor,
+        x_offset,
+        y_offset,
+        z_offset,
         min_x,
         max_x,
         min_y,

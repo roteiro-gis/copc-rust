@@ -79,6 +79,7 @@ dependencies = [
  "byteorder",
  "copc-core",
  "las",
+ "laz 0.8.3",
 ]
 
 [[package]]

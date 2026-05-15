@@ -1,5 +1,5 @@
 use copc_core::Bounds;
-use copc_reader::CopcFile;
+use copc_reader::{BoundsSelection, CopcFile, CopcReader, LodSelection};
 use copc_writer::{write_source, CopcPointFields, CopcPointSource, CopcWriterParams};
 
 struct VecSource {
@@ -85,4 +85,37 @@ fn writer_output_parses_with_reader_hierarchy() {
             .sum::<usize>(),
         source.len()
     );
+
+    let mut reader = CopcReader::open(std::fs::File::open(&path).unwrap()).unwrap();
+    let all_points = reader
+        .points(LodSelection::All, BoundsSelection::All)
+        .unwrap()
+        .collect::<copc_core::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(all_points.len(), source.len());
+    assert!(all_points
+        .iter()
+        .any(|point| u8::from(point.classification) == 2));
+
+    let mut reader = CopcReader::open(std::fs::File::open(&path).unwrap()).unwrap();
+    let root_points = reader
+        .points(LodSelection::Level(0), BoundsSelection::All)
+        .unwrap()
+        .collect::<copc_core::Result<Vec<_>>>()
+        .unwrap();
+    assert!(!root_points.is_empty());
+    assert!(root_points.len() < source.len());
+
+    let query_bounds = Bounds::new((125.0, 150.0, 0.0), (151.0, 251.0, 100.0));
+    let mut reader = CopcReader::open(std::fs::File::open(&path).unwrap()).unwrap();
+    let bounded_points = reader
+        .points(LodSelection::All, BoundsSelection::Within(query_bounds))
+        .unwrap()
+        .collect::<copc_core::Result<Vec<_>>>()
+        .unwrap();
+    assert!(!bounded_points.is_empty());
+    assert!(bounded_points.len() < all_points.len());
+    assert!(bounded_points
+        .iter()
+        .all(|point| query_bounds.contains_xyz(point.x, point.y, point.z)));
 }
