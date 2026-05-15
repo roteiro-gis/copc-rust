@@ -1,0 +1,17 @@
+External COPC fixture sources
+
+The binary fixtures in this directory are copied from upstream public test data
+and retained for reader conformance against COPC files not written by
+copc-writer.
+
+pdal/1.2-with-color.copc.laz
+  Source: https://github.com/PDAL/PDAL/blob/9745f8a2c932e362eabddb5aaaf4b73f7bf09830/test/data/copc/1.2-with-color.copc.laz
+  Upstream project license: BSD-3-Clause
+
+qgis/rgb.copc.laz
+  Source: https://github.com/qgis/QGIS/blob/100740bdd14a16517e106d0a319fce2389a76128/tests/testdata/point_clouds/copc/rgb.copc.laz
+  Upstream project license: GPL-2.0-or-later
+
+qgis/rgb16.copc.laz
+  Source: https://github.com/qgis/QGIS/blob/100740bdd14a16517e106d0a319fce2389a76128/tests/testdata/point_clouds/copc/rgb16.copc.laz
+  Upstream project license: GPL-2.0-or-later

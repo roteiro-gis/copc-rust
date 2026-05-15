@@ -4,22 +4,23 @@ use copc_core::Bounds;
 use copc_reader::{BoundsSelection, CopcFile, CopcReader, LodSelection};
 
 #[test]
-fn external_fixture_directory_is_documented() {
-    assert!(fixtures_dir().join("README.md").is_file());
-}
-
-#[test]
-#[ignore = "requires PDAL/QGIS COPC fixtures under copc-reader/tests/fixtures/external"]
-fn pdal_qgis_copc_fixtures_open_iterate_and_filter() {
+fn checked_in_copc_fixtures_open_iterate_and_filter() {
     let fixtures = fixture_paths();
-    assert!(
-        !fixtures.is_empty(),
-        "place .copc.laz fixtures under copc-reader/tests/fixtures/external/{{pdal,qgis}}"
-    );
+    assert_fixture_set("pdal", &fixtures);
+    assert_fixture_set("qgis", &fixtures);
 
     for path in fixtures {
         assert_fixture(&path);
     }
+}
+
+fn assert_fixture_set(source: &str, fixtures: &[PathBuf]) {
+    let source_dir = fixtures_dir().join(source);
+    assert!(
+        fixtures.iter().any(|path| path.starts_with(&source_dir)),
+        "missing checked-in {source} fixture under {}",
+        source_dir.display()
+    );
 }
 
 fn assert_fixture(path: &Path) {
@@ -63,7 +64,19 @@ fn assert_fixture(path: &Path) {
         .unwrap()
         .collect::<copc_core::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(bounded_points.len(), all_points.len());
+    let outside_full_bounds = all_points
+        .iter()
+        .filter(|point| !full_bounds.contains_xyz(point.x, point.y, point.z))
+        .take(4)
+        .map(|point| (point.x, point.y, point.z))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bounded_points.len(),
+        all_points.len(),
+        "{} full-file bounds selection should keep every point; first points outside header bounds: {:?}",
+        path.display(),
+        outside_full_bounds
+    );
 
     let mut reader = CopcReader::from_path(path).unwrap();
     let root_points = reader
