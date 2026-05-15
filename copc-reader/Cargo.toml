@@ -11,6 +11,10 @@ readme = "../README.md"
 documentation = "https://docs.rs/copc-reader"
 keywords = ["copc", "las", "laz", "point-cloud", "gis"]
 categories = ["science", "parser-implementations"]
+exclude = [
+    "tests/external_fixtures.rs",
+    "tests/fixtures/external/**",
+]
 
 [dependencies]
 byteorder = { workspace = true }
