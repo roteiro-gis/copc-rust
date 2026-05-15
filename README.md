@@ -16,7 +16,7 @@ read-only memory mapping of writer spill files.
 | Crate | Description |
 |---|---|
 | `copc-core` | Shared COPC metadata, hierarchy entries, voxel keys, bounds, streaming LAS records, and errors |
-| `copc-reader` | COPC header, info VLR, and hierarchy parsing with public hierarchy access |
+| `copc-reader` | COPC header/info parsing, recursive hierarchy access, and chunked-LAZ point iteration |
 | `copc-writer` | COPC writer with source-trait point access, native LOD distribution, mmap spill support, and streaming LAS/LAZ intake |
 
 ## Usage
@@ -27,6 +27,16 @@ use copc_reader::CopcFile;
 let file = CopcFile::open("cloud.copc.laz")?;
 for entry in file.hierarchy_walk() {
     println!("{:?} points={}", entry.key, entry.point_count);
+}
+```
+
+```rust
+use copc_reader::{BoundsSelection, CopcReader, LodSelection};
+
+let mut reader = CopcReader::from_path("cloud.copc.laz")?;
+for point in reader.points(LodSelection::All, BoundsSelection::All)? {
+    let point = point?;
+    println!("{},{},{}", point.x, point.y, point.z);
 }
 ```
 
@@ -45,7 +55,9 @@ convert_las_to_copc_streaming(
 ## Supported Now
 
 - Public COPC hierarchy types for availability, indexing, and tile serving
-- COPC info VLR and root hierarchy EVLR parsing
+- COPC info VLR and recursive hierarchy page parsing
+- Chunked-LAZ point iteration in `copc-reader`
+- All-points, LOD-selected, and bounds-selected reader point iteration
 - Source-trait writer API for caller-owned point storage
 - Streaming LAS/LAZ-to-COPC conversion through a disk-backed mmap spill
 - LAS 1.4 point formats 6 and 7 with LAZ variable-size chunks
@@ -53,9 +65,6 @@ convert_las_to_copc_streaming(
 
 ## Not Yet Supported
 
-- Chunked-LAZ point iteration in `copc-reader`
-- Recursive child hierarchy page loading beyond the root page
-- Bounds/LOD-selected reader point iteration
 - Materialized point-column convenience APIs
 
 ## Testing
