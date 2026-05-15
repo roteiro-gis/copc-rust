@@ -134,6 +134,11 @@ impl CopcFile {
         self.hierarchy.values().copied().collect()
     }
 
+    /// Return the full hierarchy index keyed by COPC voxel key.
+    pub fn hierarchy(&self) -> &BTreeMap<VoxelKey, Entry> {
+        &self.hierarchy
+    }
+
     pub fn hierarchy_entries(&self) -> impl Iterator<Item = &Entry> {
         self.hierarchy.values()
     }
@@ -431,4 +436,218 @@ fn read_evlr_refs<R: Read + Seek>(reader: &mut R, header: &LasHeader) -> Result<
 fn trim_nul(bytes: &[u8]) -> &str {
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use byteorder::{LittleEndian, WriteBytesExt};
+    use copc_core::{EntryAvailability, HIERARCHY_ENTRY_BYTES};
+    use laz::LazVlrBuilder;
+    use std::io::{Cursor, Write};
+
+    #[test]
+    fn hierarchy_walk_loads_recursive_child_pages() {
+        let mut fixture = Cursor::new(copc_with_child_hierarchy_page());
+        let file = CopcFile::from_reader(&mut fixture).unwrap();
+        let child_key = VoxelKey::root().child(3);
+        let grandchild_key = child_key.child(5);
+
+        assert_eq!(file.root_hierarchy().entries().len(), 2);
+        assert!(file.root_hierarchy().entries()[1].is_child_page());
+
+        let hierarchy = file.hierarchy();
+        assert_eq!(hierarchy.len(), 3);
+        assert_eq!(
+            hierarchy
+                .get(&VoxelKey::root())
+                .unwrap()
+                .availability()
+                .unwrap(),
+            EntryAvailability::PointData { point_count: 5 }
+        );
+        assert_eq!(
+            hierarchy.get(&child_key).unwrap().availability().unwrap(),
+            EntryAvailability::PointData { point_count: 4 }
+        );
+        assert_eq!(
+            hierarchy
+                .get(&grandchild_key)
+                .unwrap()
+                .availability()
+                .unwrap(),
+            EntryAvailability::PointData { point_count: 3 }
+        );
+        assert!(!hierarchy.values().any(|entry| entry.is_child_page()));
+
+        let walk = file.hierarchy_walk();
+        assert_eq!(walk.len(), hierarchy.len());
+        assert_eq!(walk.iter().map(|entry| entry.point_count).sum::<i32>(), 12);
+    }
+
+    fn copc_with_child_hierarchy_page() -> Vec<u8> {
+        let mut laz_vlr_bytes = Vec::new();
+        LazVlrBuilder::default()
+            .with_point_format(6, 0)
+            .unwrap()
+            .with_variable_chunk_size()
+            .build()
+            .write_to(&mut laz_vlr_bytes)
+            .unwrap();
+
+        let offset_to_point_data = u32::from(LAS_HEADER_SIZE_14)
+            + (54 + copc_core::info::COPC_INFO_BYTES as u32)
+            + (54 + laz_vlr_bytes.len() as u32);
+        let evlr_start = u64::from(offset_to_point_data);
+        let root_hier_offset = evlr_start + 60;
+        let root_hier_size = (2 * HIERARCHY_ENTRY_BYTES) as u64;
+        let child_page_offset = root_hier_offset + root_hier_size;
+
+        let child_key = VoxelKey::root().child(3);
+        let grandchild_key = child_key.child(5);
+        let child_page = HierarchyPage::new(vec![
+            Entry {
+                key: child_key,
+                offset: 2_000,
+                byte_size: 200,
+                point_count: 4,
+            },
+            Entry {
+                key: grandchild_key,
+                offset: 2_200,
+                byte_size: 220,
+                point_count: 3,
+            },
+        ]);
+        let child_page_bytes = child_page.write_le_bytes().unwrap();
+        let root_page = HierarchyPage::new(vec![
+            Entry {
+                key: VoxelKey::root(),
+                offset: 1_000,
+                byte_size: 100,
+                point_count: 5,
+            },
+            Entry {
+                key: child_key,
+                offset: child_page_offset,
+                byte_size: child_page_bytes.len() as i32,
+                point_count: -1,
+            },
+        ]);
+        let root_page_bytes = root_page.write_le_bytes().unwrap();
+
+        let info = CopcInfo {
+            center: (0.0, 0.0, 0.0),
+            halfsize: 10.0,
+            spacing: 1.0,
+            root_hier_offset,
+            root_hier_size,
+            gpstime_min: 0.0,
+            gpstime_max: 0.0,
+        };
+
+        let mut out = Vec::new();
+        write_las_header(&mut out, offset_to_point_data, evlr_start, 12);
+        write_vlr(&mut out, "copc", 1, &info.write_le_bytes(), "COPC info");
+        write_vlr(
+            &mut out,
+            "laszip encoded",
+            22204,
+            &laz_vlr_bytes,
+            "http://laszip.org",
+        );
+        assert_eq!(out.len(), offset_to_point_data as usize);
+
+        write_evlr_header(
+            &mut out,
+            "copc",
+            1000,
+            root_page_bytes.len() as u64,
+            "COPC hierarchy",
+        );
+        assert_eq!(out.len() as u64, root_hier_offset);
+        out.extend_from_slice(&root_page_bytes);
+        assert_eq!(out.len() as u64, child_page_offset);
+        out.extend_from_slice(&child_page_bytes);
+        out
+    }
+
+    fn write_las_header(
+        out: &mut Vec<u8>,
+        offset_to_point_data: u32,
+        evlr_start: u64,
+        point_count: u64,
+    ) {
+        out.resize(usize::from(LAS_HEADER_SIZE_14), 0);
+        out[0..4].copy_from_slice(b"LASF");
+        out[24] = 1;
+        out[25] = 4;
+        put_u16(out, 94, LAS_HEADER_SIZE_14);
+        put_u32(out, 96, offset_to_point_data);
+        put_u32(out, 100, 2);
+        out[104] = 6 | 0x80;
+        put_u16(out, 105, 30);
+        put_f64(out, 131, 0.001);
+        put_f64(out, 139, 0.001);
+        put_f64(out, 147, 0.001);
+        put_f64(out, 155, 0.0);
+        put_f64(out, 163, 0.0);
+        put_f64(out, 171, 0.0);
+        put_f64(out, 179, 10.0);
+        put_f64(out, 187, -10.0);
+        put_f64(out, 195, 10.0);
+        put_f64(out, 203, -10.0);
+        put_f64(out, 211, 10.0);
+        put_f64(out, 219, -10.0);
+        put_u64(out, 235, evlr_start);
+        put_u32(out, 243, 1);
+        put_u64(out, 247, point_count);
+    }
+
+    fn write_vlr(out: &mut Vec<u8>, user_id: &str, record_id: u16, data: &[u8], desc: &str) {
+        out.write_u16::<LittleEndian>(0).unwrap();
+        out.write_all(&padded(user_id.as_bytes(), 16)).unwrap();
+        out.write_u16::<LittleEndian>(record_id).unwrap();
+        out.write_u16::<LittleEndian>(data.len() as u16).unwrap();
+        out.write_all(&padded(desc.as_bytes(), 32)).unwrap();
+        out.write_all(data).unwrap();
+    }
+
+    fn write_evlr_header(
+        out: &mut Vec<u8>,
+        user_id: &str,
+        record_id: u16,
+        data_len: u64,
+        desc: &str,
+    ) {
+        out.write_u16::<LittleEndian>(0).unwrap();
+        out.write_all(&padded(user_id.as_bytes(), 16)).unwrap();
+        out.write_u16::<LittleEndian>(record_id).unwrap();
+        out.write_u64::<LittleEndian>(data_len).unwrap();
+        out.write_all(&padded(desc.as_bytes(), 32)).unwrap();
+    }
+
+    fn padded(bytes: &[u8], len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        let count = bytes.len().min(len);
+        out[..count].copy_from_slice(&bytes[..count]);
+        out
+    }
+
+    fn put_u16(out: &mut [u8], offset: usize, value: u16) {
+        out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(out: &mut [u8], offset: usize, value: u32) {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(out: &mut [u8], offset: usize, value: u64) {
+        out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_f64(out: &mut [u8], offset: usize, value: f64) {
+        out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
 }

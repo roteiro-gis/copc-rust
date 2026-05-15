@@ -12,6 +12,6 @@ pub mod streaming;
 pub use bounds::Bounds;
 pub use cancel::{CancelCheck, NeverCancel};
 pub use error::{Error, Result};
-pub use hierarchy::{Entry, HierarchyPage, VoxelKey};
+pub use hierarchy::{Entry, EntryAvailability, HierarchyPage, VoxelKey, HIERARCHY_ENTRY_BYTES};
 pub use info::CopcInfo;
 pub use streaming::{deserialize_le, serialize_le, LasPointRecord, StreamingLayout};
