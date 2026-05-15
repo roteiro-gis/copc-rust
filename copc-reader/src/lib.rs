@@ -148,15 +148,14 @@ impl CopcFile {
     }
 
     pub(crate) fn point_format(&self) -> Result<las::point::Format> {
-        let mut format = las::point::Format::new(self.header.point_data_record_format)
-            .map_err(|e| Error::Las(e.to_string()))?;
+        let format_id = self.header.point_data_record_format & 0x7F;
+        let mut format =
+            las::point::Format::new(format_id).map_err(|e| Error::Las(e.to_string()))?;
         let base_len = format.len();
         if self.header.point_data_record_length < base_len {
             return Err(Error::InvalidData(format!(
                 "point record length {} is smaller than point format {} base length {}",
-                self.header.point_data_record_length,
-                self.header.point_data_record_format,
-                base_len
+                self.header.point_data_record_length, format_id, base_len
             )));
         }
         format.extra_bytes = self.header.point_data_record_length - base_len;
