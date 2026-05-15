@@ -410,7 +410,7 @@ fn build_lod_nodes<S: CopcPointSource>(
         Bounds::cube(center, halfsize),
     )?;
     let mut nodes = builder.nodes;
-    nodes.sort_by(|(left, _), (right, _)| left.cmp(right));
+    nodes.sort_by_key(|(key, _)| *key);
     Ok(nodes)
 }
 
