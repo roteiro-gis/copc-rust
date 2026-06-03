@@ -79,7 +79,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check workspace
-        run: cargo +1.77.0 check --workspace --all-targets --locked
+        run: rustup run 1.77.0 cargo check --workspace --all-targets --locked
 
   package:
     name: Packaging
