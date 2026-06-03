@@ -24,16 +24,14 @@ env:
 jobs:
   checks:
     name: Checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -42,57 +40,57 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
 
   docs:
     name: Documentation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Build documentation
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
   msrv:
     name: MSRV
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.77
+        run: rustup toolchain install 1.77.0 --profile minimal --no-self-update
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Check workspace
-        run: cargo check --workspace --all-targets --locked
+        run: cargo +1.77.0 check --workspace --all-targets --locked
 
   package:
     name: Packaging
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
