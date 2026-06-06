@@ -40,8 +40,7 @@ impl LasPointRecord {
     pub fn from_las_point(point: &las::Point) -> Self {
         let scan_direction_flag =
             matches!(point.scan_direction, las::point::ScanDirection::LeftToRight);
-        let scan_angle_scaled = (point.scan_angle * 180.0 / 90.0) as i32;
-        let scan_angle = scan_angle_scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let scan_angle = point.scan_angle.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         let (red, green, blue) = match point.color {
             Some(color) => (color.red, color.green, color.blue),
             None => (32_768, 32_768, 32_768),
@@ -444,6 +443,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn from_las_point_preserves_scan_angle_degrees() {
+        let point = las::Point {
+            scan_angle: 30.0,
+            ..Default::default()
+        };
+
+        let record = LasPointRecord::from_las_point(&point);
+
+        assert_eq!(30, record.scan_angle);
     }
 
     #[test]
