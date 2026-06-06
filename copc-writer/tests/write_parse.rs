@@ -1,6 +1,9 @@
-use copc_core::Bounds;
+use copc_core::{Bounds, NeverCancel};
 use copc_reader::{BoundsSelection, CopcFile, CopcReader, LodSelection};
-use copc_writer::{write_source, CopcPointFields, CopcPointSource, CopcWriterParams};
+use copc_writer::{
+    convert_las_to_copc_streaming, write_source, CopcPointFields, CopcPointSource, CopcWriterParams,
+};
+use las::Write as _;
 
 struct VecSource {
     points: Vec<CopcPointFields>,
@@ -118,4 +121,52 @@ fn writer_output_parses_with_reader_hierarchy() {
     assert!(bounded_points
         .iter()
         .all(|point| query_bounds.contains_xyz(point.x, point.y, point.z)));
+}
+
+#[test]
+fn streaming_conversion_preserves_scan_angle_degrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("scan-angle.las");
+    let copc_path = dir.path().join("scan-angle.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let mut builder = las::Builder::from((1, 4));
+    builder.point_format = las::point::Format::new(6).unwrap();
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            scan_angle: 30.0,
+            gps_time: Some(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams {
+            max_points_per_node: 128,
+            max_depth: 4,
+        },
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap();
+
+    let mut reader = CopcReader::open(std::fs::File::open(&copc_path).unwrap()).unwrap();
+    let points = reader
+        .points(LodSelection::All, BoundsSelection::All)
+        .unwrap()
+        .collect::<copc_core::Result<Vec<_>>>()
+        .unwrap();
+
+    assert_eq!(1, points.len());
+    assert_eq!(30.0, points[0].scan_angle);
 }

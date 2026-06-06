@@ -7,7 +7,7 @@ use copc_core::{
     Bounds, CancelCheck, CopcInfo, Entry, Error, LasPointRecord, NeverCancel, Result,
     StreamingLayout, VoxelKey,
 };
-use las::Read as _;
+use las::{point::Format as LasFormat, raw, Color, Read as _};
 use laz::{LasZipCompressor, LazVlrBuilder};
 
 use crate::spill::{SpillReader, SpillWriter};
@@ -32,6 +32,7 @@ pub struct CopcPointFields {
     pub edge_of_flight_line: u8,
     pub classification: u8,
     pub user_data: u8,
+    /// Scan angle in degrees; encoded as LAS 1.4 scaled scan angle on write.
     pub scan_angle_rank: i16,
     pub point_source_id: u16,
     pub gps_time: f64,
@@ -211,7 +212,9 @@ fn write_copc_inner<S: CopcPointSource>(
 ) -> Result<()> {
     cancel.check()?;
     let point_format_id = if has_color { 7u8 } else { 6u8 };
-    let point_record_length = if has_color { 36u16 } else { 30u16 };
+    let point_format =
+        LasFormat::new(point_format_id).map_err(|e| Error::Las(format!("point format: {e}")))?;
+    let point_record_length = point_format.len();
 
     let (center, halfsize) = cube_from_bounds(&bounds);
     let (scale_x, scale_y, scale_z) = (0.001, 0.001, 0.001);
@@ -304,8 +307,7 @@ fn write_copc_inner<S: CopcPointSource>(
                 &fields,
                 (scale_x, scale_y, scale_z),
                 (offset_x, offset_y, offset_z),
-                point_format_id,
-                has_color,
+                &point_format,
             )?;
             compressor
                 .compress_one(&point_buf)
@@ -691,30 +693,14 @@ fn encode_point_record(
     fields: &CopcPointFields,
     scale: (f64, f64, f64),
     offset: (f64, f64, f64),
-    format_id: u8,
-    has_color: bool,
+    format: &LasFormat,
 ) -> Result<()> {
     let mut cursor = Cursor::new(buf);
     let ix = ((fields.x - offset.0) / scale.0).round() as i32;
     let iy = ((fields.y - offset.1) / scale.1).round() as i32;
     let iz = ((fields.z - offset.2) / scale.2).round() as i32;
-    cursor
-        .write_i32::<LittleEndian>(ix)
-        .map_err(|e| Error::io("write point x", e))?;
-    cursor
-        .write_i32::<LittleEndian>(iy)
-        .map_err(|e| Error::io("write point y", e))?;
-    cursor
-        .write_i32::<LittleEndian>(iz)
-        .map_err(|e| Error::io("write point z", e))?;
-    cursor
-        .write_u16::<LittleEndian>(fields.intensity)
-        .map_err(|e| Error::io("write intensity", e))?;
     let rn = fields.return_number & 0x0F;
     let nr = fields.number_of_returns & 0x0F;
-    cursor
-        .write_u8(rn | (nr << 4))
-        .map_err(|e| Error::io("write return flags", e))?;
     let flags = (fields.synthetic & 1)
         | ((fields.key_point & 1) << 1)
         | ((fields.withheld & 1) << 2)
@@ -722,35 +708,29 @@ fn encode_point_record(
     let chan = fields.scan_channel & 0x03;
     let sd = fields.scan_direction_flag & 1;
     let eof = fields.edge_of_flight_line & 1;
-    cursor
-        .write_u8(flags | (chan << 4) | (sd << 6) | (eof << 7))
-        .map_err(|e| Error::io("write classification flags", e))?;
-    cursor
-        .write_u8(fields.classification)
-        .map_err(|e| Error::io("write classification", e))?;
-    cursor
-        .write_u8(fields.user_data)
-        .map_err(|e| Error::io("write user data", e))?;
-    let scan_angle = (fields.scan_angle_rank as f32 / 0.006) as i16;
-    cursor
-        .write_i16::<LittleEndian>(scan_angle)
-        .map_err(|e| Error::io("write scan angle", e))?;
-    cursor
-        .write_u16::<LittleEndian>(fields.point_source_id)
-        .map_err(|e| Error::io("write point source id", e))?;
-    cursor
-        .write_f64::<LittleEndian>(fields.gps_time)
-        .map_err(|e| Error::io("write gps time", e))?;
-    if format_id == 7 && has_color {
-        cursor
-            .write_u16::<LittleEndian>(fields.red)
-            .map_err(|e| Error::io("write red", e))?;
-        cursor
-            .write_u16::<LittleEndian>(fields.green)
-            .map_err(|e| Error::io("write green", e))?;
-        cursor
-            .write_u16::<LittleEndian>(fields.blue)
-            .map_err(|e| Error::io("write blue", e))?;
-    }
+    let point = raw::Point {
+        x: ix,
+        y: iy,
+        z: iz,
+        intensity: fields.intensity,
+        flags: raw::point::Flags::ThreeByte(
+            rn | (nr << 4),
+            flags | (chan << 4) | (sd << 6) | (eof << 7),
+            fields.classification,
+        ),
+        scan_angle: raw::point::ScanAngle::from(fields.scan_angle_rank as f32),
+        user_data: fields.user_data,
+        point_source_id: fields.point_source_id,
+        gps_time: Some(fields.gps_time),
+        color: format
+            .has_color
+            .then_some(Color::new(fields.red, fields.green, fields.blue)),
+        waveform: None,
+        nir: None,
+        extra_bytes: Vec::new(),
+    };
+    point
+        .write_to(&mut cursor, format)
+        .map_err(|e| Error::Las(format!("write point record: {e}")))?;
     Ok(())
 }
