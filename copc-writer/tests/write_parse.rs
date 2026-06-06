@@ -1,9 +1,13 @@
-use copc_core::{Bounds, NeverCancel};
+use byteorder::{LittleEndian, ReadBytesExt};
+use copc_core::{Bounds, NeverCancel, StreamingLayout};
 use copc_reader::{BoundsSelection, CopcFile, CopcReader, LodSelection};
 use copc_writer::{
-    convert_las_to_copc_streaming, write_source, CopcPointFields, CopcPointSource, CopcWriterParams,
+    convert_las_to_copc_streaming, write_source, write_streaming_with_cancel, CopcPointFields,
+    CopcPointSource, CopcWriterParams,
 };
+use las::Color;
 use las::Write as _;
+use std::io::Read as _;
 
 struct VecSource {
     points: Vec<CopcPointFields>,
@@ -169,4 +173,234 @@ fn streaming_conversion_preserves_scan_angle_degrees() {
 
     assert_eq!(1, points.len());
     assert_eq!(30.0, points[0].scan_angle);
+}
+
+#[test]
+fn streaming_conversion_preserves_supported_header_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("metadata.las");
+    let copc_path = dir.path().join("metadata.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let mut builder = las::Builder::from((1, 4));
+    builder.file_source_id = 42;
+    builder.gps_time_type = las::GpsTimeType::Standard;
+    builder.has_synthetic_return_numbers = true;
+    builder.system_identifier = "source-system".to_string();
+    builder.generating_software = "source-software".to_string();
+    builder.point_format = las::point::Format::new(6).unwrap();
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap();
+
+    let header = read_las_header_prefix(&copc_path);
+    assert_eq!(42, header.file_source_id);
+    assert_eq!(25, header.global_encoding);
+    assert_eq!("source-system", header.system_identifier);
+    assert_eq!("source-software", header.generating_software);
+}
+
+#[test]
+fn streaming_conversion_rejects_unsupported_point_dimensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("unsupported-dimensions.las");
+    let copc_path = dir.path().join("unsupported-dimensions.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let mut format = las::point::Format::new(8).unwrap();
+    format.extra_bytes = 2;
+    let mut builder = las::Builder::from((1, 4));
+    builder.point_format = format;
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            color: Some(Color::new(1, 2, 3)),
+            nir: Some(4),
+            extra_bytes: vec![5, 6],
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    let err = convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("NIR point data"));
+    assert!(message.contains("extra point byte"));
+}
+
+#[test]
+fn streaming_conversion_rejects_source_vlrs() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("vlr.las");
+    let copc_path = dir.path().join("vlr.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let mut builder = las::Builder::from((1, 4));
+    builder.point_format = las::point::Format::new(6).unwrap();
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Projection".to_string(),
+        record_id: 2112,
+        description: "CRS metadata".to_string(),
+        data: vec![1, 2, 3],
+    });
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    let err = convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("VLR"));
+}
+
+#[test]
+fn streaming_conversion_allows_source_laszip_vlr() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("compressed-source.laz");
+    let copc_path = dir.path().join("compressed-source.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let mut builder = las::Builder::from((1, 4));
+    builder.point_format = las::point::Format::new(6).unwrap();
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap();
+}
+
+#[test]
+fn streaming_writer_rejects_unsupported_layout_dimensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streaming.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+    let layout = StreamingLayout {
+        point_format: 10,
+        has_gps: true,
+        has_color: true,
+        has_nir: true,
+        has_waveform: true,
+    };
+
+    let err = write_streaming_with_cancel(
+        &path,
+        layout,
+        std::iter::empty::<copc_core::Result<copc_core::LasPointRecord>>(),
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("NIR point data"));
+    assert!(message.contains("waveform point data"));
+}
+
+struct LasHeaderPrefix {
+    file_source_id: u16,
+    global_encoding: u16,
+    system_identifier: String,
+    generating_software: String,
+}
+
+fn read_las_header_prefix(path: &std::path::Path) -> LasHeaderPrefix {
+    let mut file = std::fs::File::open(path).unwrap();
+    let mut signature = [0u8; 4];
+    file.read_exact(&mut signature).unwrap();
+    assert_eq!(b"LASF", &signature);
+    let file_source_id = file.read_u16::<LittleEndian>().unwrap();
+    let global_encoding = file.read_u16::<LittleEndian>().unwrap();
+    let mut guid = [0u8; 16];
+    file.read_exact(&mut guid).unwrap();
+    let mut version = [0u8; 2];
+    file.read_exact(&mut version).unwrap();
+    let mut system_identifier = [0u8; 32];
+    file.read_exact(&mut system_identifier).unwrap();
+    let mut generating_software = [0u8; 32];
+    file.read_exact(&mut generating_software).unwrap();
+
+    LasHeaderPrefix {
+        file_source_id,
+        global_encoding,
+        system_identifier: trim_nuls(&system_identifier),
+        generating_software: trim_nuls(&generating_software),
+    }
+}
+
+fn trim_nuls(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }

@@ -13,6 +13,9 @@ use laz::{LasZipCompressor, LazVlrBuilder};
 use crate::spill::{SpillReader, SpillWriter};
 
 const CANCEL_POLL_STRIDE: usize = 4_096;
+const LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT: u16 = 16;
+const LASZIP_VLR_USER_ID: &str = "laszip encoded";
+const LASZIP_VLR_RECORD_ID: u16 = 22204;
 
 /// Normalized point fields consumed by the COPC writer.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -94,6 +97,79 @@ impl CopcPointSource for SpillSource<'_> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct OutputLasMetadata {
+    file_source_id: u16,
+    global_encoding: u16,
+    guid: [u8; 16],
+    system_identifier: String,
+    generating_software: String,
+    creation_day_of_year: u16,
+    creation_year: u16,
+    scale: (f64, f64, f64),
+    offset: Option<(f64, f64, f64)>,
+    extended_return_counts: [u64; 15],
+}
+
+impl Default for OutputLasMetadata {
+    fn default() -> Self {
+        Self {
+            file_source_id: 0,
+            global_encoding: LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT,
+            guid: [0; 16],
+            system_identifier: "copc-rust".to_string(),
+            generating_software: "copc-writer".to_string(),
+            creation_day_of_year: 0,
+            creation_year: 2026,
+            scale: (0.001, 0.001, 0.001),
+            offset: None,
+            extended_return_counts: [0; 15],
+        }
+    }
+}
+
+impl OutputLasMetadata {
+    fn from_las_header(header: &las::Header) -> Self {
+        let mut global_encoding =
+            u16::from(header.gps_time_type()) | LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT;
+        if header.has_synthetic_return_numbers() {
+            global_encoding |= 8;
+        }
+        let transforms = header.transforms();
+        let mut extended_return_counts = [0u64; 15];
+        for return_number in 1..=15 {
+            extended_return_counts[return_number - 1] = header
+                .number_of_points_by_return(return_number as u8)
+                .unwrap_or(0);
+        }
+        let (creation_day_of_year, creation_year) = header
+            .date()
+            .map(|date| {
+                let year = date.format("%Y").to_string().parse().unwrap_or(0);
+                let day = date.format("%j").to_string().parse().unwrap_or(0);
+                (day, year)
+            })
+            .unwrap_or((0, 0));
+
+        Self {
+            file_source_id: header.file_source_id(),
+            global_encoding,
+            guid: *header.guid().as_bytes(),
+            system_identifier: header.system_identifier().to_string(),
+            generating_software: header.generating_software().to_string(),
+            creation_day_of_year,
+            creation_year,
+            scale: (transforms.x.scale, transforms.y.scale, transforms.z.scale),
+            offset: Some((
+                transforms.x.offset,
+                transforms.y.offset,
+                transforms.z.offset,
+            )),
+            extended_return_counts,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CopcWriterParams {
     pub max_points_per_node: u32,
@@ -133,7 +209,15 @@ pub fn write_source_with_cancel<S: CopcPointSource>(
             "cannot write empty cloud to COPC".into(),
         ));
     }
-    write_copc_inner(path, source, has_color, bounds, params, cancel)
+    write_copc_inner(
+        path,
+        source,
+        has_color,
+        bounds,
+        params,
+        cancel,
+        &OutputLasMetadata::default(),
+    )
 }
 
 pub fn write_streaming_with_cancel<I>(
@@ -148,6 +232,7 @@ where
     I: IntoIterator<Item = Result<LasPointRecord>>,
 {
     cancel.check()?;
+    validate_streaming_layout_supported(&layout)?;
     let mut spill = SpillWriter::create(spill_dir, layout)?;
     for (index, item) in points.into_iter().enumerate() {
         if index % CANCEL_POLL_STRIDE == 0 {
@@ -157,7 +242,7 @@ where
     }
     cancel.check()?;
     let reader = spill.finalize()?;
-    write_copc_from_spill(path, reader, params, cancel)
+    write_copc_from_spill(path, reader, params, cancel, &OutputLasMetadata::default())
 }
 
 pub fn convert_las_to_copc_streaming(
@@ -169,6 +254,8 @@ pub fn convert_las_to_copc_streaming(
 ) -> Result<()> {
     cancel.check()?;
     let mut reader = las::Reader::from_path(las_path).map_err(|e| Error::Las(e.to_string()))?;
+    validate_las_conversion_supported(reader.header())?;
+    let output_metadata = OutputLasMetadata::from_las_header(reader.header());
     let layout = StreamingLayout::from_las_format(*reader.header().point_format());
     let mut spill = SpillWriter::create(spill_dir, layout)?;
     for (index, result) in reader.points().enumerate() {
@@ -181,7 +268,78 @@ pub fn convert_las_to_copc_streaming(
     }
     cancel.check()?;
     let reader = spill.finalize()?;
-    write_copc_from_spill(copc_path, reader, params, cancel)
+    write_copc_from_spill(copc_path, reader, params, cancel, &output_metadata)
+}
+
+fn validate_streaming_layout_supported(layout: &StreamingLayout) -> Result<()> {
+    let mut unsupported = Vec::new();
+    if layout.has_nir {
+        unsupported.push("NIR point data".to_string());
+    }
+    if layout.has_waveform {
+        unsupported.push("waveform point data".to_string());
+    }
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(format!(
+            "COPC writer cannot preserve {}",
+            unsupported.join(", ")
+        )))
+    }
+}
+
+fn validate_las_conversion_supported(header: &las::Header) -> Result<()> {
+    let mut unsupported = Vec::new();
+    let format = header.point_format();
+    if format.has_nir {
+        unsupported.push("NIR point data".to_string());
+    }
+    if format.has_waveform {
+        unsupported.push("waveform point data".to_string());
+    }
+    if format.extra_bytes > 0 {
+        unsupported.push(format!("{} extra point byte(s)", format.extra_bytes));
+    }
+    let unsupported_vlr_count = header
+        .vlrs()
+        .iter()
+        .filter(|vlr| !is_laszip_vlr(vlr))
+        .count();
+    if unsupported_vlr_count > 0 {
+        unsupported.push(format!("{unsupported_vlr_count} VLR(s)"));
+    }
+    if !header.evlrs().is_empty() {
+        unsupported.push(format!("{} EVLR(s)", header.evlrs().len()));
+    }
+    if !header.padding().is_empty() {
+        unsupported.push(format!("{} header padding byte(s)", header.padding().len()));
+    }
+    if !header.vlr_padding().is_empty() {
+        unsupported.push(format!(
+            "{} VLR padding byte(s)",
+            header.vlr_padding().len()
+        ));
+    }
+    if !header.point_padding().is_empty() {
+        unsupported.push(format!(
+            "{} point padding byte(s)",
+            header.point_padding().len()
+        ));
+    }
+
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(format!(
+            "LAS-to-COPC streaming conversion cannot preserve {}",
+            unsupported.join(", ")
+        )))
+    }
+}
+
+fn is_laszip_vlr(vlr: &las::Vlr) -> bool {
+    vlr.user_id == LASZIP_VLR_USER_ID && vlr.record_id == LASZIP_VLR_RECORD_ID
 }
 
 fn write_copc_from_spill(
@@ -189,8 +347,10 @@ fn write_copc_from_spill(
     reader: SpillReader,
     params: &CopcWriterParams,
     cancel: &dyn CancelCheck,
+    metadata: &OutputLasMetadata,
 ) -> Result<()> {
     cancel.check()?;
+    validate_streaming_layout_supported(&reader.layout())?;
     if reader.is_empty() {
         return Err(Error::InvalidInput(
             "cannot write empty cloud to COPC".into(),
@@ -199,7 +359,7 @@ fn write_copc_from_spill(
     let has_color = reader.layout().has_color;
     let bounds = reader.bounds();
     let source = SpillSource { reader: &reader };
-    write_copc_inner(path, &source, has_color, bounds, params, cancel)
+    write_copc_inner(path, &source, has_color, bounds, params, cancel, metadata)
 }
 
 fn write_copc_inner<S: CopcPointSource>(
@@ -209,6 +369,7 @@ fn write_copc_inner<S: CopcPointSource>(
     bounds: Bounds,
     params: &CopcWriterParams,
     cancel: &dyn CancelCheck,
+    metadata: &OutputLasMetadata,
 ) -> Result<()> {
     cancel.check()?;
     let point_format_id = if has_color { 7u8 } else { 6u8 };
@@ -217,8 +378,11 @@ fn write_copc_inner<S: CopcPointSource>(
     let point_record_length = point_format.len();
 
     let (center, halfsize) = cube_from_bounds(&bounds);
-    let (scale_x, scale_y, scale_z) = (0.001, 0.001, 0.001);
-    let (offset_x, offset_y, offset_z) = (bounds.min.0, bounds.min.1, bounds.min.2);
+    let (scale_x, scale_y, scale_z) = metadata.scale;
+    let (offset_x, offset_y, offset_z) =
+        metadata
+            .offset
+            .unwrap_or((bounds.min.0, bounds.min.1, bounds.min.2));
 
     let nodes = build_lod_nodes(source, center, halfsize, params, cancel)?;
     cancel.check()?;
@@ -247,6 +411,13 @@ fn write_copc_inner<S: CopcPointSource>(
         point_record_length,
         offset_to_point_data,
         number_of_vlrs: 2,
+        file_source_id: metadata.file_source_id,
+        global_encoding: metadata.global_encoding,
+        guid: metadata.guid,
+        system_identifier: metadata.system_identifier.clone(),
+        generating_software: metadata.generating_software.clone(),
+        creation_day_of_year: metadata.creation_day_of_year,
+        creation_year: metadata.creation_year,
         scale: (scale_x, scale_y, scale_z),
         offset: (offset_x, offset_y, offset_z),
         bounds,
@@ -254,6 +425,7 @@ fn write_copc_inner<S: CopcPointSource>(
         total_point_count: source.len() as u64,
         offset_to_first_evlr: 0,
         number_of_evlrs: 1,
+        extended_return_counts: metadata.extended_return_counts,
     };
     header.write(&mut writer)?;
 
@@ -267,8 +439,8 @@ fn write_copc_inner<S: CopcPointSource>(
 
     write_vlr_header(
         &mut writer,
-        "laszip encoded",
-        22204,
+        LASZIP_VLR_USER_ID,
+        LASZIP_VLR_RECORD_ID,
         var_vlr_bytes.len() as u16,
         "http://laszip.org",
     )?;
@@ -500,6 +672,13 @@ struct LasHeader {
     point_record_length: u16,
     offset_to_point_data: u32,
     number_of_vlrs: u32,
+    file_source_id: u16,
+    global_encoding: u16,
+    guid: [u8; 16],
+    system_identifier: String,
+    generating_software: String,
+    creation_day_of_year: u16,
+    creation_year: u16,
     scale: (f64, f64, f64),
     offset: (f64, f64, f64),
     bounds: Bounds,
@@ -507,6 +686,7 @@ struct LasHeader {
     total_point_count: u64,
     offset_to_first_evlr: u64,
     number_of_evlrs: u32,
+    extended_return_counts: [u64; 15],
 }
 
 impl LasHeader {
@@ -515,23 +695,14 @@ impl LasHeader {
             .write_all(b"LASF")
             .map_err(|e| Error::io("write LAS signature", e))?;
         writer
-            .write_u16::<LittleEndian>(0)
+            .write_u16::<LittleEndian>(self.file_source_id)
             .map_err(|e| Error::io("write file source id", e))?;
         writer
-            .write_u16::<LittleEndian>(0)
+            .write_u16::<LittleEndian>(self.global_encoding)
             .map_err(|e| Error::io("write global encoding", e))?;
         writer
-            .write_u32::<LittleEndian>(0)
-            .map_err(|e| Error::io("write GUID1", e))?;
-        writer
-            .write_u16::<LittleEndian>(0)
-            .map_err(|e| Error::io("write GUID2", e))?;
-        writer
-            .write_u16::<LittleEndian>(0)
-            .map_err(|e| Error::io("write GUID3", e))?;
-        writer
-            .write_all(&[0u8; 8])
-            .map_err(|e| Error::io("write GUID4", e))?;
+            .write_all(&self.guid)
+            .map_err(|e| Error::io("write GUID", e))?;
         writer
             .write_u8(1)
             .map_err(|e| Error::io("write version major", e))?;
@@ -539,16 +710,16 @@ impl LasHeader {
             .write_u8(4)
             .map_err(|e| Error::io("write version minor", e))?;
         writer
-            .write_all(&pad(b"copc-rust", 32))
+            .write_all(&pad(self.system_identifier.as_bytes(), 32))
             .map_err(|e| Error::io("write system id", e))?;
         writer
-            .write_all(&pad(b"copc-writer", 32))
+            .write_all(&pad(self.generating_software.as_bytes(), 32))
             .map_err(|e| Error::io("write generating software", e))?;
         writer
-            .write_u16::<LittleEndian>(0)
+            .write_u16::<LittleEndian>(self.creation_day_of_year)
             .map_err(|e| Error::io("write creation day", e))?;
         writer
-            .write_u16::<LittleEndian>(2026)
+            .write_u16::<LittleEndian>(self.creation_year)
             .map_err(|e| Error::io("write creation year", e))?;
         writer
             .write_u16::<LittleEndian>(375)
@@ -621,9 +792,9 @@ impl LasHeader {
         writer
             .write_u64::<LittleEndian>(self.total_point_count)
             .map_err(|e| Error::io("write total point count", e))?;
-        for _ in 0..15 {
+        for count in self.extended_return_counts {
             writer
-                .write_u64::<LittleEndian>(0)
+                .write_u64::<LittleEndian>(count)
                 .map_err(|e| Error::io("write extended returns", e))?;
         }
         Ok(())
