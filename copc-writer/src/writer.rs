@@ -238,7 +238,9 @@ where
         if index % CANCEL_POLL_STRIDE == 0 {
             cancel.check()?;
         }
-        spill.push(&item?)?;
+        let record = item?;
+        validate_record_coordinates(&record, index)?;
+        spill.push(&record)?;
     }
     cancel.check()?;
     let reader = spill.finalize()?;
@@ -264,6 +266,7 @@ pub fn convert_las_to_copc_streaming(
         }
         let point = result.map_err(|e| Error::Las(e.to_string()))?;
         let record = LasPointRecord::from_las_point(&point);
+        validate_record_coordinates(&record, index)?;
         spill.push(&record)?;
     }
     cancel.check()?;
@@ -342,6 +345,126 @@ fn is_laszip_vlr(vlr: &las::Vlr) -> bool {
     vlr.user_id == LASZIP_VLR_USER_ID && vlr.record_id == LASZIP_VLR_RECORD_ID
 }
 
+fn validate_record_coordinates(record: &LasPointRecord, index: usize) -> Result<()> {
+    validate_xyz_finite(index, record.x, record.y, record.z)
+}
+
+fn validate_coordinate_inputs<S: CopcPointSource>(
+    source: &S,
+    bounds: Bounds,
+    scale: (f64, f64, f64),
+    offset: (f64, f64, f64),
+    cancel: &dyn CancelCheck,
+) -> Result<()> {
+    validate_bounds(bounds)?;
+    validate_transform(scale, offset)?;
+    for index in 0..source.len() {
+        if index % CANCEL_POLL_STRIDE == 0 {
+            cancel.check()?;
+        }
+        let (x, y, z) = source.xyz(index);
+        validate_xyz_finite(index, x, y, z)?;
+        quantize_xyz(index, x, y, z, scale, offset)?;
+
+        let fields = source.fields(index)?;
+        validate_xyz_finite(index, fields.x, fields.y, fields.z)?;
+        quantize_xyz(index, fields.x, fields.y, fields.z, scale, offset)?;
+    }
+    Ok(())
+}
+
+fn validate_bounds(bounds: Bounds) -> Result<()> {
+    validate_finite_value("bounds min x", bounds.min.0)?;
+    validate_finite_value("bounds min y", bounds.min.1)?;
+    validate_finite_value("bounds min z", bounds.min.2)?;
+    validate_finite_value("bounds max x", bounds.max.0)?;
+    validate_finite_value("bounds max y", bounds.max.1)?;
+    validate_finite_value("bounds max z", bounds.max.2)?;
+    for (axis, min, max) in [
+        ("x", bounds.min.0, bounds.max.0),
+        ("y", bounds.min.1, bounds.max.1),
+        ("z", bounds.min.2, bounds.max.2),
+    ] {
+        if min > max {
+            return Err(Error::InvalidInput(format!(
+                "bounds {axis} min {min} exceeds max {max}"
+            )));
+        }
+        validate_finite_value(&format!("bounds {axis} span"), max - min)?;
+    }
+    Ok(())
+}
+
+fn validate_transform(scale: (f64, f64, f64), offset: (f64, f64, f64)) -> Result<()> {
+    for (axis, value) in [("x", scale.0), ("y", scale.1), ("z", scale.2)] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(Error::InvalidInput(format!(
+                "LAS {axis} scale must be finite and positive, got {value}"
+            )));
+        }
+    }
+    validate_finite_value("LAS x offset", offset.0)?;
+    validate_finite_value("LAS y offset", offset.1)?;
+    validate_finite_value("LAS z offset", offset.2)?;
+    Ok(())
+}
+
+fn validate_xyz_finite(index: usize, x: f64, y: f64, z: f64) -> Result<()> {
+    validate_point_axis_finite(index, "x", x)?;
+    validate_point_axis_finite(index, "y", y)?;
+    validate_point_axis_finite(index, "z", z)
+}
+
+fn validate_point_axis_finite(index: usize, axis: &str, value: f64) -> Result<()> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "point {index} {axis} coordinate must be finite, got {value}"
+        )))
+    }
+}
+
+fn validate_finite_value(name: &str, value: f64) -> Result<()> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "{name} must be finite, got {value}"
+        )))
+    }
+}
+
+fn quantize_xyz(
+    index: usize,
+    x: f64,
+    y: f64,
+    z: f64,
+    scale: (f64, f64, f64),
+    offset: (f64, f64, f64),
+) -> Result<(i32, i32, i32)> {
+    Ok((
+        quantize_axis(index, "x", x, scale.0, offset.0)?,
+        quantize_axis(index, "y", y, scale.1, offset.1)?,
+        quantize_axis(index, "z", z, scale.2, offset.2)?,
+    ))
+}
+
+fn quantize_axis(index: usize, axis: &str, value: f64, scale: f64, offset: f64) -> Result<i32> {
+    let scaled = ((value - offset) / scale).round();
+    if !scaled.is_finite() {
+        return Err(Error::InvalidInput(format!(
+            "point {index} {axis} coordinate cannot be encoded with scale {scale} and offset {offset}"
+        )));
+    }
+    if scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
+        return Err(Error::InvalidInput(format!(
+            "point {index} {axis} coordinate {value} encodes to {scaled}, outside LAS i32 range"
+        )));
+    }
+    Ok(scaled as i32)
+}
+
 fn write_copc_from_spill(
     path: &Path,
     reader: SpillReader,
@@ -377,12 +500,19 @@ fn write_copc_inner<S: CopcPointSource>(
         LasFormat::new(point_format_id).map_err(|e| Error::Las(format!("point format: {e}")))?;
     let point_record_length = point_format.len();
 
-    let (center, halfsize) = cube_from_bounds(&bounds);
     let (scale_x, scale_y, scale_z) = metadata.scale;
     let (offset_x, offset_y, offset_z) =
         metadata
             .offset
             .unwrap_or((bounds.min.0, bounds.min.1, bounds.min.2));
+    validate_coordinate_inputs(
+        source,
+        bounds,
+        (scale_x, scale_y, scale_z),
+        (offset_x, offset_y, offset_z),
+        cancel,
+    )?;
+    let (center, halfsize) = cube_from_bounds(&bounds);
 
     let nodes = build_lod_nodes(source, center, halfsize, params, cancel)?;
     cancel.check()?;
@@ -479,6 +609,7 @@ fn write_copc_inner<S: CopcPointSource>(
                 &fields,
                 (scale_x, scale_y, scale_z),
                 (offset_x, offset_y, offset_z),
+                source_index as usize,
                 &point_format,
             )?;
             compressor
@@ -659,10 +790,14 @@ fn child_octant(bounds: Bounds, x: f64, y: f64, z: f64) -> usize {
 }
 
 fn cube_from_bounds(bounds: &Bounds) -> ((f64, f64, f64), f64) {
-    let center = bounds.center();
     let dx = bounds.max.0 - bounds.min.0;
     let dy = bounds.max.1 - bounds.min.1;
     let dz = bounds.max.2 - bounds.min.2;
+    let center = (
+        bounds.min.0 + dx * 0.5,
+        bounds.min.1 + dy * 0.5,
+        bounds.min.2 + dz * 0.5,
+    );
     let halfsize = (dx.max(dy).max(dz) * 0.5).max(1e-6);
     (center, halfsize)
 }
@@ -864,12 +999,11 @@ fn encode_point_record(
     fields: &CopcPointFields,
     scale: (f64, f64, f64),
     offset: (f64, f64, f64),
+    point_index: usize,
     format: &LasFormat,
 ) -> Result<()> {
     let mut cursor = Cursor::new(buf);
-    let ix = ((fields.x - offset.0) / scale.0).round() as i32;
-    let iy = ((fields.y - offset.1) / scale.1).round() as i32;
-    let iz = ((fields.z - offset.2) / scale.2).round() as i32;
+    let (ix, iy, iz) = quantize_xyz(point_index, fields.x, fields.y, fields.z, scale, offset)?;
     let rn = fields.return_number & 0x0F;
     let nr = fields.number_of_returns & 0x0F;
     let flags = (fields.synthetic & 1)

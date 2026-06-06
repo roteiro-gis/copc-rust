@@ -128,6 +128,74 @@ fn writer_output_parses_with_reader_hierarchy() {
 }
 
 #[test]
+fn writer_rejects_non_finite_bounds() {
+    let source = VecSource {
+        points: vec![point_fields(0.0, 0.0, 0.0)],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("non-finite-bounds.copc.laz");
+
+    let err = write_source(
+        &path,
+        &source,
+        false,
+        Bounds::new((0.0, 0.0, 0.0), (f64::INFINITY, 0.0, 0.0)),
+        &CopcWriterParams::default(),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("bounds max x must be finite"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn writer_rejects_non_finite_source_coordinate() {
+    let source = VecSource {
+        points: vec![point_fields(f64::NAN, 0.0, 0.0)],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("non-finite-point.copc.laz");
+
+    let err = write_source(
+        &path,
+        &source,
+        false,
+        Bounds::point(0.0, 0.0, 0.0),
+        &CopcWriterParams::default(),
+    )
+    .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("point 0 x coordinate must be finite"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn writer_rejects_coordinate_outside_las_i32_range() {
+    let source = VecSource {
+        points: vec![
+            point_fields(0.0, 0.0, 0.0),
+            point_fields(5_000_000.0, 0.0, 0.0),
+        ],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out-of-range-point.copc.laz");
+
+    let err = write_source(
+        &path,
+        &source,
+        false,
+        Bounds::new((0.0, 0.0, 0.0), (5_000_000.0, 0.0, 0.0)),
+        &CopcWriterParams::default(),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("outside LAS i32 range"));
+    assert!(!path.exists());
+}
+
+#[test]
 fn streaming_conversion_preserves_scan_angle_degrees() {
     let dir = tempfile::tempdir().unwrap();
     let las_path = dir.path().join("scan-angle.las");
@@ -366,6 +434,36 @@ fn streaming_writer_rejects_unsupported_layout_dimensions() {
     assert!(message.contains("waveform point data"));
 }
 
+#[test]
+fn streaming_writer_rejects_non_finite_record_coordinate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streaming-non-finite.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+    let layout = StreamingLayout {
+        point_format: 6,
+        has_gps: true,
+        has_color: false,
+        has_nir: false,
+        has_waveform: false,
+    };
+
+    let err = write_streaming_with_cancel(
+        &path,
+        layout,
+        vec![Ok(las_record(f64::INFINITY, 0.0, 0.0))],
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("point 0 x coordinate must be finite"));
+    assert!(!path.exists());
+}
+
 struct LasHeaderPrefix {
     file_source_id: u16,
     global_encoding: u16,
@@ -403,4 +501,61 @@ fn trim_nuls(bytes: &[u8]) -> String {
         .position(|&byte| byte == 0)
         .unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn point_fields(x: f64, y: f64, z: f64) -> CopcPointFields {
+    CopcPointFields {
+        x,
+        y,
+        z,
+        intensity: 0,
+        return_number: 1,
+        number_of_returns: 1,
+        synthetic: 0,
+        key_point: 0,
+        withheld: 0,
+        overlap: 0,
+        scan_channel: 0,
+        scan_direction_flag: 0,
+        edge_of_flight_line: 0,
+        classification: 0,
+        user_data: 0,
+        scan_angle_rank: 0,
+        point_source_id: 0,
+        gps_time: 0.0,
+        red: 0,
+        green: 0,
+        blue: 0,
+    }
+}
+
+fn las_record(x: f64, y: f64, z: f64) -> copc_core::LasPointRecord {
+    copc_core::LasPointRecord {
+        x,
+        y,
+        z,
+        intensity: 0,
+        return_number: 1,
+        number_of_returns: 1,
+        classification: 0,
+        scan_direction_flag: false,
+        edge_of_flight_line: false,
+        scan_angle: 0,
+        user_data: 0,
+        point_source_id: 0,
+        synthetic: false,
+        key_point: false,
+        withheld: false,
+        overlap: false,
+        scan_channel: 0,
+        gps_time: 0.0,
+        red: 0,
+        green: 0,
+        blue: 0,
+        nir: 0,
+        wave_packet_descriptor_index: 0,
+        byte_offset_to_waveform_data: 0,
+        waveform_packet_size: 0,
+        return_point_waveform_location: 0.0,
+    }
 }
