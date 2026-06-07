@@ -1,51 +1,41 @@
 //! Disk spill for streaming COPC writes.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use copc_core::{
     deserialize_le, serialize_le, Bounds, Error, LasPointRecord, Result, StreamingLayout,
 };
 use memmap2::Mmap;
-
-static SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+use tempfile::{NamedTempFile, TempPath};
 
 /// Streams `LasPointRecord` values to a process-local temporary spill file.
 pub struct SpillWriter {
+    #[cfg(test)]
     path: PathBuf,
-    file: Option<BufWriter<File>>,
+    file: Option<BufWriter<NamedTempFile>>,
     layout: StreamingLayout,
     record_width: usize,
     scratch: Vec<u8>,
     count: u64,
     bounds: Option<Bounds>,
-    keep_file: bool,
 }
 
 impl SpillWriter {
     pub fn create(spill_dir: &Path, layout: StreamingLayout) -> Result<Self> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let sequence = SPILL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = format!(
-            ".copc-writer-spill.{}.{}.{}.part",
-            std::process::id(),
-            nanos,
-            sequence
-        );
-        let path = spill_dir.join(name);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let file = tempfile::Builder::new()
+            .prefix(".copc-writer-spill.")
+            .suffix(".part")
+            .tempfile_in(spill_dir)
             .map_err(|e| Error::io("create spill file", e))?;
+        #[cfg(test)]
+        let path = file.path().to_path_buf();
         let record_width = layout.record_width();
         Ok(Self {
+            #[cfg(test)]
             path,
             file: Some(BufWriter::new(file)),
             layout,
@@ -53,7 +43,6 @@ impl SpillWriter {
             scratch: vec![0u8; record_width],
             count: 0,
             bounds: None,
-            keep_file: false,
         })
     }
 
@@ -89,30 +78,34 @@ impl SpillWriter {
         let file = writer
             .into_inner()
             .map_err(|e| Error::io("unwrap spill writer", e.into_error()))?;
-        file.sync_all()
+        file.as_file()
+            .sync_all()
             .map_err(|e| Error::io("sync spill file", e))?;
-        self.keep_file = true;
-        let path = self.path.clone();
+        let mmap_file = file
+            .reopen()
+            .map_err(|e| Error::io("open spill for mmap", e))?;
+        let temp_path = file.into_temp_path();
         let count = usize::try_from(self.count)
             .map_err(|_| Error::InvalidInput("spill record count exceeds usize range".into()))?;
         let bounds = self.bounds.unwrap_or_else(|| Bounds::point(0.0, 0.0, 0.0));
-        SpillReader::open(path, self.layout, self.record_width, count, bounds)
-    }
-}
-
-impl Drop for SpillWriter {
-    fn drop(&mut self) {
-        if !self.keep_file {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        SpillReader::open(
+            temp_path,
+            mmap_file,
+            self.layout,
+            self.record_width,
+            count,
+            bounds,
+        )
     }
 }
 
 /// Memory-mapped random-access view over a finalized spill file.
 pub struct SpillReader {
+    #[cfg(test)]
     path: PathBuf,
-    _file: File,
     mmap: Mmap,
+    _file: File,
+    _path: TempPath,
     layout: StreamingLayout,
     record_width: usize,
     count: usize,
@@ -121,13 +114,15 @@ pub struct SpillReader {
 
 impl SpillReader {
     fn open(
-        path: PathBuf,
+        temp_path: TempPath,
+        file: File,
         layout: StreamingLayout,
         record_width: usize,
         count: usize,
         bounds: Bounds,
     ) -> Result<Self> {
-        let file = File::open(&path).map_err(|e| Error::io("open spill for mmap", e))?;
+        #[cfg(test)]
+        let path = temp_path.to_path_buf();
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| Error::io("mmap spill file", e))?;
         let expected = record_width
             .checked_mul(count)
@@ -140,9 +135,11 @@ impl SpillReader {
             )));
         }
         Ok(Self {
+            #[cfg(test)]
             path,
-            _file: file,
             mmap,
+            _file: file,
+            _path: temp_path,
             layout,
             record_width,
             count,
@@ -191,12 +188,6 @@ impl SpillReader {
         }
         deserialize_le(self.record_bytes(index), &self.layout)
             .map_err(|e| Error::InvalidData(format!("decode spill record {index}: {e}")))
-    }
-}
-
-impl Drop for SpillReader {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -288,5 +279,20 @@ mod tests {
         assert!(path.exists());
         drop(reader);
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_file_is_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SpillWriter::create(dir.path(), layout_with_color()).unwrap();
+        let mode = std::fs::metadata(&writer.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
