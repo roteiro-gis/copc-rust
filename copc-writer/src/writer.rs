@@ -108,7 +108,6 @@ struct OutputLasMetadata {
     creation_year: u16,
     scale: (f64, f64, f64),
     offset: Option<(f64, f64, f64)>,
-    extended_return_counts: [u64; 15],
 }
 
 impl Default for OutputLasMetadata {
@@ -123,7 +122,6 @@ impl Default for OutputLasMetadata {
             creation_year: 2026,
             scale: (0.001, 0.001, 0.001),
             offset: None,
-            extended_return_counts: [0; 15],
         }
     }
 }
@@ -136,12 +134,6 @@ impl OutputLasMetadata {
             global_encoding |= 8;
         }
         let transforms = header.transforms();
-        let mut extended_return_counts = [0u64; 15];
-        for return_number in 1..=15 {
-            extended_return_counts[return_number - 1] = header
-                .number_of_points_by_return(return_number as u8)
-                .unwrap_or(0);
-        }
         let (creation_day_of_year, creation_year) = header
             .date()
             .map(|date| {
@@ -165,8 +157,34 @@ impl OutputLasMetadata {
                 transforms.y.offset,
                 transforms.z.offset,
             )),
-            extended_return_counts,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PointStats {
+    gpstime_min: f64,
+    gpstime_max: f64,
+    extended_return_counts: [u64; 15],
+}
+
+impl PointStats {
+    fn new() -> Self {
+        Self {
+            gpstime_min: f64::INFINITY,
+            gpstime_max: f64::NEG_INFINITY,
+            extended_return_counts: [0; 15],
+        }
+    }
+
+    fn record(&mut self, index: usize, fields: &CopcPointFields) -> Result<()> {
+        validate_finite_value(&format!("point {index} GPS time"), fields.gps_time)?;
+        self.gpstime_min = self.gpstime_min.min(fields.gps_time);
+        self.gpstime_max = self.gpstime_max.max(fields.gps_time);
+        if (1..=15).contains(&fields.return_number) {
+            self.extended_return_counts[usize::from(fields.return_number - 1)] += 1;
+        }
+        Ok(())
     }
 }
 
@@ -355,9 +373,10 @@ fn validate_coordinate_inputs<S: CopcPointSource>(
     scale: (f64, f64, f64),
     offset: (f64, f64, f64),
     cancel: &dyn CancelCheck,
-) -> Result<()> {
+) -> Result<PointStats> {
     validate_bounds(bounds)?;
     validate_transform(scale, offset)?;
+    let mut stats = PointStats::new();
     for index in 0..source.len() {
         if index % CANCEL_POLL_STRIDE == 0 {
             cancel.check()?;
@@ -369,8 +388,9 @@ fn validate_coordinate_inputs<S: CopcPointSource>(
         let fields = source.fields(index)?;
         validate_xyz_finite(index, fields.x, fields.y, fields.z)?;
         quantize_xyz(index, fields.x, fields.y, fields.z, scale, offset)?;
+        stats.record(index, &fields)?;
     }
-    Ok(())
+    Ok(stats)
 }
 
 fn validate_bounds(bounds: Bounds) -> Result<()> {
@@ -505,7 +525,7 @@ fn write_copc_inner<S: CopcPointSource>(
         metadata
             .offset
             .unwrap_or((bounds.min.0, bounds.min.1, bounds.min.2));
-    validate_coordinate_inputs(
+    let point_stats = validate_coordinate_inputs(
         source,
         bounds,
         (scale_x, scale_y, scale_z),
@@ -555,7 +575,7 @@ fn write_copc_inner<S: CopcPointSource>(
         total_point_count: source.len() as u64,
         offset_to_first_evlr: 0,
         number_of_evlrs: 1,
-        extended_return_counts: metadata.extended_return_counts,
+        extended_return_counts: point_stats.extended_return_counts,
     };
     header.write(&mut writer)?;
 
@@ -669,8 +689,8 @@ fn write_copc_inner<S: CopcPointSource>(
         spacing: halfsize / 128.0,
         root_hier_offset,
         root_hier_size: hierarchy_body_size,
-        gpstime_min: 0.0,
-        gpstime_max: 0.0,
+        gpstime_min: point_stats.gpstime_min,
+        gpstime_max: point_stats.gpstime_max,
     };
     writer
         .write_all(&info.write_le_bytes())

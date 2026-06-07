@@ -7,7 +7,7 @@ use copc_writer::{
 };
 use las::Color;
 use las::Write as _;
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 
 struct VecSource {
     points: Vec<CopcPointFields>,
@@ -128,6 +128,48 @@ fn writer_output_parses_with_reader_hierarchy() {
 }
 
 #[test]
+fn writer_emits_gps_time_range_and_return_histogram() {
+    let specs = [
+        (0.0, 100.0, 1u8),
+        (1.0, 75.0, 2u8),
+        (2.0, 120.0, 2u8),
+        (3.0, 90.0, 15u8),
+    ];
+    let points: Vec<CopcPointFields> = specs
+        .iter()
+        .map(|&(x, gps_time, return_number)| {
+            let mut point = point_fields(x, x, x);
+            point.gps_time = gps_time;
+            point.return_number = return_number;
+            point.number_of_returns = 15;
+            point
+        })
+        .collect();
+    let bounds = points.iter().fold(
+        Bounds::point(points[0].x, points[0].y, points[0].z),
+        |mut bounds, point| {
+            bounds.extend(point.x, point.y, point.z);
+            bounds
+        },
+    );
+    let source = VecSource { points };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("point-stats.copc.laz");
+
+    write_source(&path, &source, false, bounds, &CopcWriterParams::default()).unwrap();
+
+    let file = CopcFile::open(&path).unwrap();
+    assert_eq!(75.0, file.copc_info().gpstime_min);
+    assert_eq!(120.0, file.copc_info().gpstime_max);
+
+    let return_counts = read_extended_return_counts(&path);
+    assert_eq!(1, return_counts[0]);
+    assert_eq!(2, return_counts[1]);
+    assert_eq!(1, return_counts[14]);
+    assert_eq!(4, return_counts.iter().sum::<u64>());
+}
+
+#[test]
 fn writer_rejects_non_finite_bounds() {
     let source = VecSource {
         points: vec![point_fields(0.0, 0.0, 0.0)],
@@ -168,6 +210,29 @@ fn writer_rejects_non_finite_source_coordinate() {
     assert!(err
         .to_string()
         .contains("point 0 x coordinate must be finite"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn writer_rejects_non_finite_gps_time() {
+    let mut point = point_fields(0.0, 0.0, 0.0);
+    point.gps_time = f64::NAN;
+    let source = VecSource {
+        points: vec![point],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("non-finite-gps-time.copc.laz");
+
+    let err = write_source(
+        &path,
+        &source,
+        false,
+        Bounds::point(0.0, 0.0, 0.0),
+        &CopcWriterParams::default(),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("point 0 GPS time must be finite"));
     assert!(!path.exists());
 }
 
@@ -493,6 +558,16 @@ fn read_las_header_prefix(path: &std::path::Path) -> LasHeaderPrefix {
         system_identifier: trim_nuls(&system_identifier),
         generating_software: trim_nuls(&generating_software),
     }
+}
+
+fn read_extended_return_counts(path: &std::path::Path) -> [u64; 15] {
+    let mut file = std::fs::File::open(path).unwrap();
+    file.seek(SeekFrom::Start(255)).unwrap();
+    let mut counts = [0; 15];
+    for count in &mut counts {
+        *count = file.read_u64::<LittleEndian>().unwrap();
+    }
+    counts
 }
 
 fn trim_nuls(bytes: &[u8]) -> String {
