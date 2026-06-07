@@ -13,13 +13,23 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use copc_core::{CopcInfo, Entry, Error, HierarchyPage, Result, VoxelKey};
+use copc_core::{
+    CopcInfo, Entry, EntryAvailability, Error, HierarchyPage, Result, VoxelKey,
+    HIERARCHY_ENTRY_BYTES,
+};
 use las::{Transform, Vector};
 use laz::LazVlr;
 
 pub use points::{BoundsSelection, CopcReader, LodSelection, PointIter, PointQuery};
 
 const LAS_HEADER_SIZE_14: u16 = 375;
+const VLR_HEADER_BYTES: u64 = 54;
+const EVLR_HEADER_BYTES: u64 = 60;
+const MAX_VLR_COUNT: u32 = 4_096;
+const MAX_EVLR_COUNT: u32 = 4_096;
+const MAX_HIERARCHY_PAGE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_HIERARCHY_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
 /// A parsed COPC file.
 #[derive(Debug, Clone)]
 pub struct CopcFile {
@@ -75,8 +85,14 @@ impl CopcFile {
     }
 
     pub fn from_reader<R: Read + Seek>(reader: &mut R) -> Result<Self> {
-        let header = read_las_header(reader)?;
-        let vlrs = read_vlrs(reader, header.number_of_vlrs)?;
+        let file_len = reader_len(reader)?;
+        let header = read_las_header(reader, file_len)?;
+        let vlrs = read_vlrs(
+            reader,
+            header.number_of_vlrs,
+            file_len,
+            u64::from(header.offset_to_point_data),
+        )?;
         let copc_info_vlr = vlrs
             .iter()
             .find(|vlr| vlr.user_id == "copc" && vlr.record_id == 1)
@@ -90,7 +106,7 @@ impl CopcFile {
             })
             .transpose()?
             .ok_or_else(|| Error::InvalidData("missing LASzip VLR".into()))?;
-        let evlrs = read_evlr_refs(reader, &header)?;
+        let evlrs = read_evlr_refs(reader, &header, file_len)?;
         let root_evlr = evlrs
             .iter()
             .find(|evlr| trim_nul(&evlr.user_id) == "copc" && evlr.record_id == 1000)
@@ -102,12 +118,25 @@ impl CopcFile {
                 copc_info.root_hier_offset, root_evlr.data_offset
             )));
         }
-        let root_hierarchy =
-            read_hierarchy_page_at(reader, copc_info.root_hier_offset, copc_info.root_hier_size)?;
+        let mut hierarchy_limits = HierarchyReadLimits::default();
+        let root_hierarchy = read_hierarchy_page_at(
+            reader,
+            copc_info.root_hier_offset,
+            copc_info.root_hier_size,
+            file_len,
+            &mut hierarchy_limits,
+        )?;
         let mut hierarchy = BTreeMap::new();
         let mut visited_pages = HashSet::new();
         visited_pages.insert((copc_info.root_hier_offset, copc_info.root_hier_size));
-        insert_hierarchy_page(reader, &root_hierarchy, &mut hierarchy, &mut visited_pages)?;
+        insert_hierarchy_page(
+            reader,
+            &root_hierarchy,
+            &mut hierarchy,
+            &mut visited_pages,
+            file_len,
+            &mut hierarchy_limits,
+        )?;
         Ok(Self {
             header,
             copc_info,
@@ -186,11 +215,78 @@ impl LasHeader {
     }
 }
 
+#[derive(Debug, Default)]
+struct HierarchyReadLimits {
+    total_bytes: u64,
+}
+
+impl HierarchyReadLimits {
+    fn add_page(&mut self, byte_size: u64) -> Result<()> {
+        if byte_size > MAX_HIERARCHY_PAGE_BYTES {
+            return Err(Error::InvalidData(format!(
+                "hierarchy page is {byte_size} bytes, max supported is {MAX_HIERARCHY_PAGE_BYTES}"
+            )));
+        }
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(byte_size)
+            .ok_or_else(|| Error::InvalidData("hierarchy byte total overflow".into()))?;
+        if self.total_bytes > MAX_HIERARCHY_TOTAL_BYTES {
+            return Err(Error::InvalidData(format!(
+                "hierarchy pages total {} bytes, max supported is {}",
+                self.total_bytes, MAX_HIERARCHY_TOTAL_BYTES
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn reader_len<R: Seek>(reader: &mut R) -> Result<u64> {
+    let current = reader
+        .stream_position()
+        .map_err(|e| Error::io("record reader position", e))?;
+    let len = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|e| Error::io("seek end of COPC file", e))?;
+    reader
+        .seek(SeekFrom::Start(current))
+        .map_err(|e| Error::io("restore reader position", e))?;
+    Ok(len)
+}
+
+fn checked_range_end(offset: u64, byte_size: u64, label: &str) -> Result<u64> {
+    offset
+        .checked_add(byte_size)
+        .ok_or_else(|| Error::InvalidData(format!("{label} offset/size overflow")))
+}
+
+fn validate_range_in_file(offset: u64, byte_size: u64, file_len: u64, label: &str) -> Result<u64> {
+    let end = checked_range_end(offset, byte_size, label)?;
+    if end > file_len {
+        return Err(Error::InvalidData(format!(
+            "{label} range {offset}..{end} exceeds file length {file_len}"
+        )));
+    }
+    Ok(end)
+}
+
 fn read_hierarchy_page_at<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
     byte_size: u64,
+    file_len: u64,
+    limits: &mut HierarchyReadLimits,
 ) -> Result<HierarchyPage> {
+    if byte_size == 0 {
+        return Err(Error::InvalidData("hierarchy page is empty".into()));
+    }
+    if byte_size % HIERARCHY_ENTRY_BYTES as u64 != 0 {
+        return Err(Error::InvalidData(format!(
+            "hierarchy page is {byte_size} bytes, not a multiple of {HIERARCHY_ENTRY_BYTES}"
+        )));
+    }
+    limits.add_page(byte_size)?;
+    validate_range_in_file(offset, byte_size, file_len, "hierarchy page")?;
     let hierarchy_len = usize::try_from(byte_size)
         .map_err(|_| Error::InvalidData("hierarchy page is too large".into()))?;
     let mut hierarchy_bytes = vec![0u8; hierarchy_len];
@@ -208,32 +304,75 @@ fn insert_hierarchy_page<R: Read + Seek>(
     page: &HierarchyPage,
     hierarchy: &mut BTreeMap<VoxelKey, Entry>,
     visited_pages: &mut HashSet<(u64, u64)>,
+    file_len: u64,
+    limits: &mut HierarchyReadLimits,
 ) -> Result<()> {
     for entry in page.entries().iter().copied() {
+        validate_hierarchy_entry(entry, file_len)?;
         hierarchy.insert(entry.key, entry);
     }
     for entry in page.entries().iter().copied().filter(|e| e.is_child_page()) {
-        if entry.byte_size <= 0 {
-            return Err(Error::InvalidData(format!(
-                "child hierarchy page {:?} has invalid byte size {}",
-                entry.key, entry.byte_size
-            )));
-        }
-        let byte_size = u64::try_from(entry.byte_size).map_err(|_| {
-            Error::InvalidData(format!(
-                "child hierarchy page {:?} has negative byte size {}",
-                entry.key, entry.byte_size
-            ))
-        })?;
+        let byte_size = u64::try_from(entry.byte_size).expect("validated child page byte size");
         if visited_pages.insert((entry.offset, byte_size)) {
-            let child_page = read_hierarchy_page_at(reader, entry.offset, byte_size)?;
-            insert_hierarchy_page(reader, &child_page, hierarchy, visited_pages)?;
+            let child_page =
+                read_hierarchy_page_at(reader, entry.offset, byte_size, file_len, limits)?;
+            insert_hierarchy_page(
+                reader,
+                &child_page,
+                hierarchy,
+                visited_pages,
+                file_len,
+                limits,
+            )?;
         }
     }
     Ok(())
 }
 
-fn read_las_header<R: Read + Seek>(reader: &mut R) -> Result<LasHeader> {
+fn validate_hierarchy_entry(entry: Entry, file_len: u64) -> Result<()> {
+    match entry.availability()? {
+        EntryAvailability::Empty => Ok(()),
+        EntryAvailability::PointData { .. } => {
+            if entry.byte_size <= 0 {
+                return Err(Error::InvalidData(format!(
+                    "point data entry {:?} has invalid byte size {}",
+                    entry.key, entry.byte_size
+                )));
+            }
+            let byte_size = u64::try_from(entry.byte_size).map_err(|_| {
+                Error::InvalidData(format!(
+                    "point data entry {:?} has negative byte size {}",
+                    entry.key, entry.byte_size
+                ))
+            })?;
+            validate_range_in_file(entry.offset, byte_size, file_len, "point data entry")?;
+            Ok(())
+        }
+        EntryAvailability::ChildPage => {
+            if entry.byte_size <= 0 {
+                return Err(Error::InvalidData(format!(
+                    "child hierarchy page {:?} has invalid byte size {}",
+                    entry.key, entry.byte_size
+                )));
+            }
+            let byte_size = u64::try_from(entry.byte_size).map_err(|_| {
+                Error::InvalidData(format!(
+                    "child hierarchy page {:?} has negative byte size {}",
+                    entry.key, entry.byte_size
+                ))
+            })?;
+            validate_range_in_file(entry.offset, byte_size, file_len, "child hierarchy page")?;
+            Ok(())
+        }
+    }
+}
+
+fn read_las_header<R: Read + Seek>(reader: &mut R, file_len: u64) -> Result<LasHeader> {
+    if file_len < u64::from(LAS_HEADER_SIZE_14) {
+        return Err(Error::InvalidData(format!(
+            "file is {file_len} bytes; COPC requires at least {LAS_HEADER_SIZE_14}"
+        )));
+    }
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|e| Error::io("seek LAS header", e))?;
@@ -255,12 +394,32 @@ fn read_las_header<R: Read + Seek>(reader: &mut R) -> Result<LasHeader> {
             "LAS header is {header_size} bytes; COPC requires LAS 1.4"
         )));
     }
+    if u64::from(header_size) > file_len {
+        return Err(Error::InvalidData(format!(
+            "LAS header size {header_size} exceeds file length {file_len}"
+        )));
+    }
     let offset_to_point_data = reader
         .read_u32::<LittleEndian>()
         .map_err(|e| Error::io("read point data offset", e))?;
+    if u64::from(offset_to_point_data) < u64::from(header_size) {
+        return Err(Error::InvalidData(format!(
+            "point data offset {offset_to_point_data} is before LAS header size {header_size}"
+        )));
+    }
+    if u64::from(offset_to_point_data) > file_len {
+        return Err(Error::InvalidData(format!(
+            "point data offset {offset_to_point_data} exceeds file length {file_len}"
+        )));
+    }
     let number_of_vlrs = reader
         .read_u32::<LittleEndian>()
         .map_err(|e| Error::io("read VLR count", e))?;
+    if number_of_vlrs > MAX_VLR_COUNT {
+        return Err(Error::InvalidData(format!(
+            "VLR count {number_of_vlrs} exceeds max supported {MAX_VLR_COUNT}"
+        )));
+    }
     let point_data_record_format = reader
         .read_u8()
         .map_err(|e| Error::io("read point record format", e))?;
@@ -315,6 +474,16 @@ fn read_las_header<R: Read + Seek>(reader: &mut R) -> Result<LasHeader> {
     let number_of_evlrs = reader
         .read_u32::<LittleEndian>()
         .map_err(|e| Error::io("read EVLR count", e))?;
+    if number_of_evlrs > MAX_EVLR_COUNT {
+        return Err(Error::InvalidData(format!(
+            "EVLR count {number_of_evlrs} exceeds max supported {MAX_EVLR_COUNT}"
+        )));
+    }
+    if offset_to_first_evlr != 0 && offset_to_first_evlr > file_len {
+        return Err(Error::InvalidData(format!(
+            "first EVLR offset {offset_to_first_evlr} exceeds file length {file_len}"
+        )));
+    }
     let number_of_points = reader
         .read_u64::<LittleEndian>()
         .map_err(|e| Error::io("read point count", e))?;
@@ -344,9 +513,28 @@ fn read_las_header<R: Read + Seek>(reader: &mut R) -> Result<LasHeader> {
     })
 }
 
-fn read_vlrs<R: Read>(reader: &mut R, count: u32) -> Result<Vec<Vlr>> {
-    let mut vlrs = Vec::with_capacity(count as usize);
-    for _ in 0..count {
+fn read_vlrs<R: Read + Seek>(
+    reader: &mut R,
+    count: u32,
+    file_len: u64,
+    section_end: u64,
+) -> Result<Vec<Vlr>> {
+    if count > MAX_VLR_COUNT {
+        return Err(Error::InvalidData(format!(
+            "VLR count {count} exceeds max supported {MAX_VLR_COUNT}"
+        )));
+    }
+    if section_end > file_len {
+        return Err(Error::InvalidData(format!(
+            "VLR section end {section_end} exceeds file length {file_len}"
+        )));
+    }
+    let mut vlrs = Vec::new();
+    for index in 0..count {
+        let header_offset = reader
+            .stream_position()
+            .map_err(|e| Error::io("record VLR offset", e))?;
+        validate_range_in_file(header_offset, VLR_HEADER_BYTES, section_end, "VLR header")?;
         let _reserved = reader
             .read_u16::<LittleEndian>()
             .map_err(|e| Error::io("read VLR reserved", e))?;
@@ -364,31 +552,76 @@ fn read_vlrs<R: Read>(reader: &mut R, count: u32) -> Result<Vec<Vlr>> {
         reader
             .read_exact(&mut description)
             .map_err(|e| Error::io("read VLR description", e))?;
-        let mut data = vec![0u8; usize::from(record_length)];
-        reader
-            .read_exact(&mut data)
-            .map_err(|e| Error::io("read VLR data", e))?;
-        vlrs.push(Vlr {
-            user_id: trim_nul(&user_id).to_string(),
-            record_id,
-            data,
-        });
+        let data_offset = reader
+            .stream_position()
+            .map_err(|e| Error::io("record VLR data offset", e))?;
+        let data_end = validate_range_in_file(
+            data_offset,
+            u64::from(record_length),
+            section_end,
+            "VLR data",
+        )?;
+        let user_id_str = trim_nul(&user_id).to_string();
+        if should_store_vlr(&user_id_str, record_id) {
+            let mut data = vec![0u8; usize::from(record_length)];
+            reader
+                .read_exact(&mut data)
+                .map_err(|e| Error::io("read VLR data", e))?;
+            vlrs.push(Vlr {
+                user_id: user_id_str,
+                record_id,
+                data,
+            });
+        } else {
+            reader
+                .seek(SeekFrom::Start(data_end))
+                .map_err(|e| Error::io("skip VLR data", e))?;
+        }
+        let actual_next = reader
+            .stream_position()
+            .map_err(|e| Error::io("record next VLR offset", e))?;
+        if actual_next != data_end {
+            return Err(Error::InvalidData(format!(
+                "VLR {index} cursor at {actual_next}, expected {data_end}"
+            )));
+        }
     }
     Ok(vlrs)
 }
 
-fn read_evlr_refs<R: Read + Seek>(reader: &mut R, header: &LasHeader) -> Result<Vec<EvlrRef>> {
+fn should_store_vlr(user_id: &str, record_id: u16) -> bool {
+    (user_id == "copc" && record_id == 1) || (user_id == "laszip encoded" && record_id == 22204)
+}
+
+fn read_evlr_refs<R: Read + Seek>(
+    reader: &mut R,
+    header: &LasHeader,
+    file_len: u64,
+) -> Result<Vec<EvlrRef>> {
     if header.offset_to_first_evlr == 0 || header.number_of_evlrs == 0 {
         return Ok(Vec::new());
     }
+    if header.number_of_evlrs > MAX_EVLR_COUNT {
+        return Err(Error::InvalidData(format!(
+            "EVLR count {} exceeds max supported {}",
+            header.number_of_evlrs, MAX_EVLR_COUNT
+        )));
+    }
+    validate_range_in_file(
+        header.offset_to_first_evlr,
+        EVLR_HEADER_BYTES,
+        file_len,
+        "first EVLR header",
+    )?;
     reader
         .seek(SeekFrom::Start(header.offset_to_first_evlr))
         .map_err(|e| Error::io("seek EVLRs", e))?;
-    let mut evlrs = Vec::with_capacity(header.number_of_evlrs as usize);
-    for _ in 0..header.number_of_evlrs {
-        let _header_start = reader
+    let mut evlrs = Vec::new();
+    for index in 0..header.number_of_evlrs {
+        let header_start = reader
             .stream_position()
             .map_err(|e| Error::io("record EVLR offset", e))?;
+        validate_range_in_file(header_start, EVLR_HEADER_BYTES, file_len, "EVLR header")?;
         let _reserved = reader
             .read_u16::<LittleEndian>()
             .map_err(|e| Error::io("read EVLR reserved", e))?;
@@ -414,18 +647,16 @@ fn read_evlr_refs<R: Read + Seek>(reader: &mut R, header: &LasHeader) -> Result<
             record_id,
             data_offset,
         });
+        let expected_next = validate_range_in_file(data_offset, data_len, file_len, "EVLR data")?;
         reader
-            .seek(SeekFrom::Current(i64::try_from(data_len).map_err(
-                |_| Error::InvalidData("EVLR length exceeds seek range".into()),
-            )?))
+            .seek(SeekFrom::Start(expected_next))
             .map_err(|e| Error::io("skip EVLR data", e))?;
-        let expected_next = data_offset + data_len;
         let actual_next = reader
             .stream_position()
             .map_err(|e| Error::io("record next EVLR offset", e))?;
         if actual_next != expected_next {
             return Err(Error::InvalidData(format!(
-                "EVLR cursor at {actual_next}, expected {expected_next}"
+                "EVLR {index} cursor at {actual_next}, expected {expected_next}"
             )));
         }
     }
@@ -485,6 +716,57 @@ mod tests {
         assert_eq!(walk.iter().map(|entry| entry.point_count).sum::<i32>(), 12);
     }
 
+    #[test]
+    fn rejects_excessive_vlr_count_before_allocation() {
+        let mut bytes = copc_with_child_hierarchy_page();
+        put_u32(&mut bytes, 100, MAX_VLR_COUNT + 1);
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("VLR count"));
+    }
+
+    #[test]
+    fn rejects_excessive_evlr_count_before_allocation() {
+        let mut bytes = copc_with_child_hierarchy_page();
+        put_u32(&mut bytes, 243, MAX_EVLR_COUNT + 1);
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("EVLR count"));
+    }
+
+    #[test]
+    fn rejects_oversized_root_hierarchy_page_before_allocation() {
+        let mut bytes = copc_with_child_hierarchy_page();
+        let copc_info_data = usize::from(LAS_HEADER_SIZE_14) + VLR_HEADER_BYTES as usize;
+        put_u64(
+            &mut bytes,
+            copc_info_data + 48,
+            MAX_HIERARCHY_PAGE_BYTES + HIERARCHY_ENTRY_BYTES as u64,
+        );
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("hierarchy page"));
+        assert!(err.to_string().contains("max supported"));
+    }
+
+    #[test]
+    fn rejects_child_hierarchy_page_outside_file() {
+        let mut bytes = copc_with_child_hierarchy_page();
+        let copc_info_data = usize::from(LAS_HEADER_SIZE_14) + VLR_HEADER_BYTES as usize;
+        let root_hier_offset = read_u64(&bytes, copc_info_data + 40) as usize;
+        let child_entry_offset_field = root_hier_offset + HIERARCHY_ENTRY_BYTES + 16;
+        let outside_file = bytes.len() as u64 + 1;
+        put_u64(&mut bytes, child_entry_offset_field, outside_file);
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("child hierarchy page"));
+        assert!(err.to_string().contains("exceeds file length"));
+    }
+
     fn copc_with_child_hierarchy_page() -> Vec<u8> {
         let mut laz_vlr_bytes = Vec::new();
         LazVlrBuilder::default()
@@ -498,7 +780,10 @@ mod tests {
         let offset_to_point_data = u32::from(LAS_HEADER_SIZE_14)
             + (54 + copc_core::info::COPC_INFO_BYTES as u32)
             + (54 + laz_vlr_bytes.len() as u32);
-        let evlr_start = u64::from(offset_to_point_data);
+        let root_point_offset = u64::from(offset_to_point_data);
+        let child_point_offset = root_point_offset + 100;
+        let grandchild_point_offset = child_point_offset + 200;
+        let evlr_start = grandchild_point_offset + 220;
         let root_hier_offset = evlr_start + 60;
         let root_hier_size = (2 * HIERARCHY_ENTRY_BYTES) as u64;
         let child_page_offset = root_hier_offset + root_hier_size;
@@ -508,13 +793,13 @@ mod tests {
         let child_page = HierarchyPage::new(vec![
             Entry {
                 key: child_key,
-                offset: 2_000,
+                offset: child_point_offset,
                 byte_size: 200,
                 point_count: 4,
             },
             Entry {
                 key: grandchild_key,
-                offset: 2_200,
+                offset: grandchild_point_offset,
                 byte_size: 220,
                 point_count: 3,
             },
@@ -523,7 +808,7 @@ mod tests {
         let root_page = HierarchyPage::new(vec![
             Entry {
                 key: VoxelKey::root(),
-                offset: 1_000,
+                offset: root_point_offset,
                 byte_size: 100,
                 point_count: 5,
             },
@@ -557,6 +842,7 @@ mod tests {
             "http://laszip.org",
         );
         assert_eq!(out.len(), offset_to_point_data as usize);
+        out.resize(evlr_start as usize, 0);
 
         write_evlr_header(
             &mut out,
@@ -644,6 +930,10 @@ mod tests {
 
     fn put_u64(out: &mut [u8], offset: usize, value: u64) {
         out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
     }
 
     fn put_f64(out: &mut [u8], offset: usize, value: f64) {
