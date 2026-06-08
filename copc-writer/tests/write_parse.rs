@@ -14,6 +14,8 @@ struct VecSource {
     points: Vec<CopcPointFields>,
 }
 
+type PointMutator = fn(&mut CopcPointFields);
+
 impl CopcPointSource for VecSource {
     fn len(&self) -> usize {
         self.points.len()
@@ -312,6 +314,59 @@ fn writer_rejects_non_finite_gps_time() {
 
     assert!(err.to_string().contains("point 0 GPS time must be finite"));
     assert!(!path.exists());
+}
+
+#[test]
+fn writer_rejects_out_of_range_point_flag_fields() {
+    let cases: [(&str, PointMutator); 9] = [
+        ("return_number", |point: &mut CopcPointFields| {
+            point.return_number = 16
+        }),
+        ("number_of_returns", |point: &mut CopcPointFields| {
+            point.number_of_returns = 16
+        }),
+        ("synthetic", |point: &mut CopcPointFields| {
+            point.synthetic = 2
+        }),
+        ("key_point", |point: &mut CopcPointFields| {
+            point.key_point = 2
+        }),
+        ("withheld", |point: &mut CopcPointFields| point.withheld = 2),
+        ("overlap", |point: &mut CopcPointFields| point.overlap = 2),
+        ("scan_channel", |point: &mut CopcPointFields| {
+            point.scan_channel = 4
+        }),
+        ("scan_direction_flag", |point: &mut CopcPointFields| {
+            point.scan_direction_flag = 2
+        }),
+        ("edge_of_flight_line", |point: &mut CopcPointFields| {
+            point.edge_of_flight_line = 2
+        }),
+    ];
+    for (name, mutate) in cases {
+        let mut point = point_fields(0.0, 0.0, 0.0);
+        mutate(&mut point);
+        let source = VecSource {
+            points: vec![point],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{name}.copc.laz"));
+
+        let err = write_source(
+            &path,
+            &source,
+            false,
+            Bounds::point(0.0, 0.0, 0.0),
+            &CopcWriterParams::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(name),
+            "expected error to mention {name}, got {err}"
+        );
+        assert!(!path.exists());
+    }
 }
 
 #[test]
