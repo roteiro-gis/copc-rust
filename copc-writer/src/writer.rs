@@ -17,7 +17,6 @@ const CANCEL_POLL_STRIDE: usize = 4_096;
 const HIERARCHY_PAGE_MAX_ENTRIES: usize = 4_096;
 const INDEX_RECORD_BYTES: u64 = 4;
 const LAS_14_SCAN_ANGLE_SCALE: f32 = 0.006;
-const LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT: u16 = 16;
 const LASZIP_VLR_USER_ID: &str = "laszip encoded";
 const LASZIP_VLR_RECORD_ID: u16 = 22204;
 
@@ -118,7 +117,7 @@ impl Default for OutputLasMetadata {
     fn default() -> Self {
         Self {
             file_source_id: 0,
-            global_encoding: LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT,
+            global_encoding: 0,
             guid: [0; 16],
             system_identifier: "copc-rust".to_string(),
             generating_software: "copc-writer".to_string(),
@@ -132,8 +131,7 @@ impl Default for OutputLasMetadata {
 
 impl OutputLasMetadata {
     fn from_las_header(header: &las::Header) -> Self {
-        let mut global_encoding =
-            u16::from(header.gps_time_type()) | LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT;
+        let mut global_encoding = u16::from(header.gps_time_type());
         if header.has_synthetic_return_numbers() {
             global_encoding |= 8;
         }

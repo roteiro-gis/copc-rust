@@ -189,6 +189,10 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
 
     write_source(&path, &source, true, bounds, &CopcWriterParams::default()).unwrap();
 
+    let header = read_las_header_prefix(&path);
+    assert_eq!(0, header.global_encoding);
+    assert_eq!(2, header.number_of_vlrs);
+
     let mut copc_reader = CopcReader::open(std::fs::File::open(&path).unwrap()).unwrap();
     let copc_points = copc_reader
         .points(LodSelection::All, BoundsSelection::All)
@@ -481,7 +485,8 @@ fn streaming_conversion_preserves_supported_header_metadata() {
 
     let header = read_las_header_prefix(&copc_path);
     assert_eq!(42, header.file_source_id);
-    assert_eq!(25, header.global_encoding);
+    assert_eq!(9, header.global_encoding);
+    assert_eq!(2, header.number_of_vlrs);
     assert_eq!("source-system", header.system_identifier);
     assert_eq!("source-software", header.generating_software);
 }
@@ -710,6 +715,7 @@ fn streaming_writer_rejects_non_finite_record_coordinate() {
 struct LasHeaderPrefix {
     file_source_id: u16,
     global_encoding: u16,
+    number_of_vlrs: u32,
     system_identifier: String,
     generating_software: String,
 }
@@ -729,10 +735,13 @@ fn read_las_header_prefix(path: &std::path::Path) -> LasHeaderPrefix {
     file.read_exact(&mut system_identifier).unwrap();
     let mut generating_software = [0u8; 32];
     file.read_exact(&mut generating_software).unwrap();
+    file.seek(SeekFrom::Start(100)).unwrap();
+    let number_of_vlrs = file.read_u32::<LittleEndian>().unwrap();
 
     LasHeaderPrefix {
         file_source_id,
         global_encoding,
+        number_of_vlrs,
         system_identifier: trim_nuls(&system_identifier),
         generating_software: trim_nuls(&generating_software),
     }
