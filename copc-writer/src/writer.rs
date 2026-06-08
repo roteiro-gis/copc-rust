@@ -391,9 +391,44 @@ fn validate_coordinate_inputs<S: CopcPointSource>(
         let fields = source.fields(index)?;
         validate_xyz_finite(index, fields.x, fields.y, fields.z)?;
         quantize_xyz(index, fields.x, fields.y, fields.z, scale, offset)?;
+        validate_point_flags(index, &fields)?;
         stats.record(index, &fields)?;
     }
     Ok(stats)
+}
+
+fn validate_point_flags(index: usize, fields: &CopcPointFields) -> Result<()> {
+    validate_point_field_range(index, "return_number", fields.return_number, 0, 15)?;
+    validate_point_field_range(index, "number_of_returns", fields.number_of_returns, 0, 15)?;
+    validate_point_field_range(index, "synthetic", fields.synthetic, 0, 1)?;
+    validate_point_field_range(index, "key_point", fields.key_point, 0, 1)?;
+    validate_point_field_range(index, "withheld", fields.withheld, 0, 1)?;
+    validate_point_field_range(index, "overlap", fields.overlap, 0, 1)?;
+    validate_point_field_range(index, "scan_channel", fields.scan_channel, 0, 3)?;
+    validate_point_field_range(
+        index,
+        "scan_direction_flag",
+        fields.scan_direction_flag,
+        0,
+        1,
+    )?;
+    validate_point_field_range(
+        index,
+        "edge_of_flight_line",
+        fields.edge_of_flight_line,
+        0,
+        1,
+    )
+}
+
+fn validate_point_field_range(index: usize, name: &str, value: u8, min: u8, max: u8) -> Result<()> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "point {index} {name} must be in {min}..={max}, got {value}"
+        )))
+    }
 }
 
 fn validate_bounds(bounds: Bounds) -> Result<()> {
@@ -1396,23 +1431,19 @@ fn encode_point_record(
 ) -> Result<()> {
     let mut cursor = Cursor::new(buf);
     let (ix, iy, iz) = quantize_xyz(point_index, fields.x, fields.y, fields.z, scale, offset)?;
-    let rn = fields.return_number & 0x0F;
-    let nr = fields.number_of_returns & 0x0F;
-    let flags = (fields.synthetic & 1)
-        | ((fields.key_point & 1) << 1)
-        | ((fields.withheld & 1) << 2)
-        | ((fields.overlap & 1) << 3);
-    let chan = fields.scan_channel & 0x03;
-    let sd = fields.scan_direction_flag & 1;
-    let eof = fields.edge_of_flight_line & 1;
+    let flags =
+        fields.synthetic | (fields.key_point << 1) | (fields.withheld << 2) | (fields.overlap << 3);
     let point = raw::Point {
         x: ix,
         y: iy,
         z: iz,
         intensity: fields.intensity,
         flags: raw::point::Flags::ThreeByte(
-            rn | (nr << 4),
-            flags | (chan << 4) | (sd << 6) | (eof << 7),
+            fields.return_number | (fields.number_of_returns << 4),
+            flags
+                | (fields.scan_channel << 4)
+                | (fields.scan_direction_flag << 6)
+                | (fields.edge_of_flight_line << 7),
             fields.classification,
         ),
         scan_angle: raw::point::ScanAngle::from(fields.scan_angle_rank as f32),
