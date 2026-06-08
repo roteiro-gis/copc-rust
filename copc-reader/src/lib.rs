@@ -767,6 +767,115 @@ mod tests {
         assert!(err.to_string().contains("exceeds file length"));
     }
 
+    #[test]
+    fn rejects_header_offsets_outside_file_before_allocation() {
+        for (offset, value, expected) in [
+            (94, u64::from(u16::MAX), "LAS header size"),
+            (96, 1, "point data offset"),
+            (96, u64::MAX, "point data offset"),
+            (235, u64::MAX, "first EVLR offset"),
+        ] {
+            let mut bytes = copc_with_child_hierarchy_page();
+            put_int(&mut bytes, offset, value);
+
+            let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_vlr_and_evlr_lengths_outside_file_before_allocation() {
+        let mut bytes = copc_with_child_hierarchy_page();
+        let first_vlr_length_field = usize::from(LAS_HEADER_SIZE_14) + 20;
+        put_u16(&mut bytes, first_vlr_length_field, u16::MAX);
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("VLR data"));
+        assert!(err.to_string().contains("exceeds file length"));
+
+        let mut bytes = copc_with_child_hierarchy_page();
+        let evlr_start = read_u64(&bytes, 235) as usize;
+        let evlr_length_field = evlr_start + 20;
+        put_u64(&mut bytes, evlr_length_field, u64::MAX);
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("EVLR data"));
+        assert!(
+            err.to_string().contains("overflow") || err.to_string().contains("exceeds file length")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_root_hierarchy_sizes() {
+        for (root_hier_size, expected) in [
+            (0, "empty"),
+            (HIERARCHY_ENTRY_BYTES as u64 - 1, "not a multiple"),
+        ] {
+            let mut bytes = copc_with_child_hierarchy_page();
+            let copc_info_data = usize::from(LAS_HEADER_SIZE_14) + VLR_HEADER_BYTES as usize;
+            put_u64(&mut bytes, copc_info_data + 48, root_hier_size);
+
+            let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_hierarchy_entry_byte_sizes() {
+        let mut bytes = copc_with_child_hierarchy_page();
+        let copc_info_data = usize::from(LAS_HEADER_SIZE_14) + VLR_HEADER_BYTES as usize;
+        let root_hier_offset = read_u64(&bytes, copc_info_data + 40) as usize;
+        put_i32(&mut bytes, root_hier_offset + 24, 0);
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("point data entry"));
+        assert!(err.to_string().contains("invalid byte size"));
+
+        let mut bytes = copc_with_child_hierarchy_page();
+        let root_hier_offset = read_u64(&bytes, copc_info_data + 40) as usize;
+        put_i32(&mut bytes, root_hier_offset + HIERARCHY_ENTRY_BYTES + 24, 0);
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("child hierarchy page"));
+        assert!(err.to_string().contains("invalid byte size"));
+    }
+
+    #[test]
+    fn truncated_inputs_fail_without_panicking() {
+        let bytes = copc_with_child_hierarchy_page();
+        for len in [
+            0,
+            1,
+            4,
+            128,
+            usize::from(LAS_HEADER_SIZE_14) - 1,
+            usize::from(LAS_HEADER_SIZE_14),
+            bytes.len() / 2,
+            bytes.len() - 1,
+        ] {
+            let truncated = bytes[..len].to_vec();
+
+            let err = CopcFile::from_reader(&mut Cursor::new(truncated)).unwrap_err();
+
+            assert!(
+                !err.to_string().is_empty(),
+                "truncated input length {len} produced an empty error"
+            );
+        }
+    }
+
     fn copc_with_child_hierarchy_page() -> Vec<u8> {
         let mut laz_vlr_bytes = Vec::new();
         LazVlrBuilder::default()
@@ -930,6 +1039,19 @@ mod tests {
 
     fn put_u64(out: &mut [u8], offset: usize, value: u64) {
         out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_i32(out: &mut [u8], offset: usize, value: i32) {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_int(out: &mut [u8], offset: usize, value: u64) {
+        match offset {
+            94 => put_u16(out, offset, value as u16),
+            96 => put_u32(out, offset, value as u32),
+            235 => put_u64(out, offset, value),
+            _ => unreachable!("unexpected integer offset"),
+        }
     }
 
     fn read_u64(bytes: &[u8], offset: usize) -> u64 {

@@ -5,8 +5,9 @@ use copc_writer::{
     convert_las_to_copc_streaming, write_source, write_streaming_with_cancel, CopcPointFields,
     CopcPointSource, CopcWriterParams,
 };
-use las::Color;
-use las::Write as _;
+use las::point::ScanDirection;
+use las::{Color, Point};
+use las::{Read as _, Write as _};
 use std::io::{Read as _, Seek as _, SeekFrom};
 
 struct VecSource {
@@ -125,6 +126,83 @@ fn writer_output_parses_with_reader_hierarchy() {
     assert!(bounded_points
         .iter()
         .all(|point| query_bounds.contains_xyz(point.x, point.y, point.z)));
+}
+
+#[test]
+fn writer_round_trips_fields_through_copc_and_las_readers() {
+    let points = vec![
+        CopcPointFields {
+            x: 10.125,
+            y: -20.5,
+            z: 3.25,
+            intensity: 123,
+            return_number: 1,
+            number_of_returns: 3,
+            synthetic: 1,
+            key_point: 0,
+            withheld: 0,
+            overlap: 1,
+            scan_channel: 2,
+            scan_direction_flag: 1,
+            edge_of_flight_line: 0,
+            classification: 7,
+            user_data: 42,
+            scan_angle_rank: -30,
+            point_source_id: 77,
+            gps_time: 12345.5,
+            red: 1000,
+            green: 2000,
+            blue: 3000,
+        },
+        CopcPointFields {
+            x: 11.0,
+            y: -19.25,
+            z: 4.75,
+            intensity: 456,
+            return_number: 2,
+            number_of_returns: 3,
+            synthetic: 0,
+            key_point: 1,
+            withheld: 1,
+            overlap: 0,
+            scan_channel: 1,
+            scan_direction_flag: 0,
+            edge_of_flight_line: 1,
+            classification: 9,
+            user_data: 7,
+            scan_angle_rank: 15,
+            point_source_id: 78,
+            gps_time: 12346.25,
+            red: 4000,
+            green: 5000,
+            blue: 6000,
+        },
+    ];
+    let bounds = source_bounds(&points);
+    let source = VecSource {
+        points: points.clone(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fields.copc.laz");
+
+    write_source(&path, &source, true, bounds, &CopcWriterParams::default()).unwrap();
+
+    let mut copc_reader = CopcReader::open(std::fs::File::open(&path).unwrap()).unwrap();
+    let copc_points = copc_reader
+        .points(LodSelection::All, BoundsSelection::All)
+        .unwrap()
+        .collect::<copc_core::Result<Vec<_>>>()
+        .unwrap();
+    assert_las_points_match_fields(&points, &copc_points);
+
+    let mut las_reader = las::Reader::from_path(&path).unwrap();
+    assert_eq!(7, las_reader.header().point_format().to_u8().unwrap());
+    assert_eq!(points.len() as u64, las_reader.header().number_of_points());
+    let las_points = las_reader
+        .points()
+        .collect::<las::Result<Vec<_>>>()
+        .unwrap();
+    assert_las_points_match_fields(&points, &las_points);
 }
 
 #[test]
@@ -396,6 +474,51 @@ fn streaming_conversion_rejects_unsupported_point_dimensions() {
 }
 
 #[test]
+fn streaming_conversion_rejects_waveform_point_dimensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("waveform.las");
+    let copc_path = dir.path().join("waveform.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let mut builder = las::Builder::from((1, 4));
+    builder.point_format = las::point::Format::new(9).unwrap();
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            waveform: Some(las::raw::point::Waveform {
+                wave_packet_descriptor_index: 1,
+                byte_offset_to_waveform_data: 0,
+                waveform_packet_size_in_bytes: 1,
+                return_point_waveform_location: 0.0,
+                x_t: 0.0,
+                y_t: 0.0,
+                z_t: 0.0,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    let err = convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("waveform point data"));
+}
+
+#[test]
 fn streaming_conversion_rejects_source_vlrs() {
     let dir = tempfile::tempdir().unwrap();
     let las_path = dir.path().join("vlr.las");
@@ -568,6 +691,53 @@ fn read_extended_return_counts(path: &std::path::Path) -> [u64; 15] {
         *count = file.read_u64::<LittleEndian>().unwrap();
     }
     counts
+}
+
+fn source_bounds(points: &[CopcPointFields]) -> Bounds {
+    points.iter().fold(
+        Bounds::point(points[0].x, points[0].y, points[0].z),
+        |mut bounds, point| {
+            bounds.extend(point.x, point.y, point.z);
+            bounds
+        },
+    )
+}
+
+fn assert_las_points_match_fields(expected: &[CopcPointFields], actual: &[Point]) {
+    assert_eq!(expected.len(), actual.len());
+    for (expected, actual) in expected.iter().zip(actual) {
+        assert_eq!(expected.x, actual.x);
+        assert_eq!(expected.y, actual.y);
+        assert_eq!(expected.z, actual.z);
+        assert_eq!(expected.intensity, actual.intensity);
+        assert_eq!(expected.return_number, actual.return_number);
+        assert_eq!(expected.number_of_returns, actual.number_of_returns);
+        assert_eq!(expected.synthetic != 0, actual.is_synthetic);
+        assert_eq!(expected.key_point != 0, actual.is_key_point);
+        assert_eq!(expected.withheld != 0, actual.is_withheld);
+        assert_eq!(expected.overlap != 0, actual.is_overlap);
+        assert_eq!(expected.scan_channel, actual.scanner_channel);
+        assert_eq!(
+            expected.scan_direction_flag != 0,
+            actual.scan_direction == ScanDirection::LeftToRight
+        );
+        assert_eq!(
+            expected.edge_of_flight_line != 0,
+            actual.is_edge_of_flight_line
+        );
+        assert_eq!(expected.classification, u8::from(actual.classification));
+        assert_eq!(expected.user_data, actual.user_data);
+        assert_eq!(expected.scan_angle_rank as f32, actual.scan_angle);
+        assert_eq!(expected.point_source_id, actual.point_source_id);
+        assert_eq!(Some(expected.gps_time), actual.gps_time);
+        assert_eq!(
+            Some(Color::new(expected.red, expected.green, expected.blue)),
+            actual.color
+        );
+        assert!(actual.extra_bytes.is_empty());
+        assert_eq!(None, actual.nir);
+        assert_eq!(None, actual.waveform);
+    }
 }
 
 fn trim_nuls(bytes: &[u8]) -> String {
