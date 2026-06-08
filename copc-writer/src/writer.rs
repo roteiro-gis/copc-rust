@@ -773,10 +773,10 @@ fn plan_hierarchy_pages(entries: &[Entry], key: VoxelKey) -> Result<HierarchyPag
             continue;
         }
         let mut matched = false;
-        for octant in 0..8 {
+        for (octant, child_entries) in child_entries.iter_mut().enumerate() {
             let child_key = key.child(octant as u8);
             if key_contains(child_key, entry.key) {
-                child_entries[octant].push(entry);
+                child_entries.push(entry);
                 matched = true;
                 break;
             }
