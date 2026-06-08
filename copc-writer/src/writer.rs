@@ -1,18 +1,21 @@
 use std::fs::File;
-use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use byteorder::{LittleEndian, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use copc_core::{
     Bounds, CancelCheck, CopcInfo, Entry, Error, LasPointRecord, NeverCancel, Result,
-    StreamingLayout, VoxelKey,
+    StreamingLayout, VoxelKey, HIERARCHY_ENTRY_BYTES,
 };
 use las::{point::Format as LasFormat, raw, Color, Read as _};
 use laz::{LasZipCompressor, LazVlrBuilder};
+use tempfile::{NamedTempFile, TempPath};
 
 use crate::spill::{SpillReader, SpillWriter};
 
 const CANCEL_POLL_STRIDE: usize = 4_096;
+const HIERARCHY_PAGE_MAX_ENTRIES: usize = 4_096;
+const INDEX_RECORD_BYTES: u64 = 4;
 const LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT: u16 = 16;
 const LASZIP_VLR_USER_ID: &str = "laszip encoded";
 const LASZIP_VLR_RECORD_ID: u16 = 22204;
@@ -534,7 +537,7 @@ fn write_copc_inner<S: CopcPointSource>(
     )?;
     let (center, halfsize) = cube_from_bounds(&bounds);
 
-    let nodes = build_lod_nodes(source, center, halfsize, params, cancel)?;
+    let lod_index = build_lod_index(source, center, halfsize, params, cancel)?;
     cancel.check()?;
 
     let var_vlr = LazVlrBuilder::default()
@@ -609,7 +612,10 @@ fn write_copc_inner<S: CopcPointSource>(
 
     let mut compressor = LasZipCompressor::new(&mut writer, var_vlr.clone())
         .map_err(|e| Error::Las(format!("compressor: {e}")))?;
-    let mut hierarchy: Vec<Entry> = Vec::with_capacity(nodes.len());
+    let mut hierarchy: Vec<Entry> = Vec::with_capacity(lod_index.nodes.len());
+    let order_path: &Path = lod_index.order_path.as_ref();
+    let mut index_reader =
+        BufReader::new(File::open(order_path).map_err(|e| Error::io("open LOD order", e))?);
     let mut point_buf = vec![0u8; point_record_length as usize];
     let mut chunk_start_file_offset = compressor
         .get_mut()
@@ -617,12 +623,19 @@ fn write_copc_inner<S: CopcPointSource>(
         .map_err(|e| Error::io("record chunk start", e))?;
     chunk_start_file_offset += 8;
 
-    for (key, indices) in &nodes {
+    for node in &lod_index.nodes {
         cancel.check()?;
-        for (point_index, &source_index) in indices.iter().enumerate() {
+        index_reader
+            .seek(SeekFrom::Start(node.start))
+            .map_err(|e| Error::io("seek LOD order", e))?;
+        for point_index in 0..node.count {
             if point_index % CANCEL_POLL_STRIDE == 0 {
                 cancel.check()?;
             }
+            let source_index = index_reader
+                .read_u32::<LittleEndian>()
+                .map_err(|e| Error::io("read LOD order", e))?
+                as usize;
             let fields = source.fields(source_index as usize)?;
             encode_point_record(
                 &mut point_buf,
@@ -643,11 +656,15 @@ fn write_copc_inner<S: CopcPointSource>(
             .get_mut()
             .stream_position()
             .map_err(|e| Error::io("record chunk end", e))?;
+        let byte_size = i32::try_from(after - chunk_start_file_offset)
+            .map_err(|_| Error::InvalidInput("LAZ chunk exceeds COPC i32 byte size".into()))?;
+        let point_count = i32::try_from(node.count)
+            .map_err(|_| Error::InvalidInput("node point count exceeds COPC i32 range".into()))?;
         hierarchy.push(Entry {
-            key: *key,
+            key: node.key,
             offset: chunk_start_file_offset,
-            byte_size: (after - chunk_start_file_offset) as i32,
-            point_count: indices.len() as i32,
+            byte_size,
+            point_count,
         });
         chunk_start_file_offset = after;
     }
@@ -661,7 +678,14 @@ fn write_copc_inner<S: CopcPointSource>(
     let evlr_start = writer
         .stream_position()
         .map_err(|e| Error::io("record EVLR start", e))?;
-    let hierarchy_body_size = (hierarchy.len() * 32) as u64;
+    let root_hier_offset = evlr_start
+        .checked_add(60)
+        .ok_or_else(|| Error::InvalidInput("hierarchy EVLR offset overflow".into()))?;
+    let mut hierarchy_pages = plan_hierarchy_pages(&hierarchy, VoxelKey::root())?;
+    let hierarchy_end = assign_hierarchy_page_offsets(&mut hierarchy_pages, root_hier_offset)?;
+    let hierarchy_body_size = hierarchy_end
+        .checked_sub(root_hier_offset)
+        .ok_or_else(|| Error::InvalidInput("hierarchy size overflow".into()))?;
     write_evlr_header(
         &mut writer,
         "copc",
@@ -669,16 +693,15 @@ fn write_copc_inner<S: CopcPointSource>(
         hierarchy_body_size,
         "COPC hierarchy",
     )?;
-    let root_hier_offset = writer
+    let actual_root_hier_offset = writer
         .stream_position()
         .map_err(|e| Error::io("record root hierarchy offset", e))?;
-    let mut entry_buf = [0u8; 32];
-    for entry in &hierarchy {
-        entry.write_le(&mut entry_buf)?;
-        writer
-            .write_all(&entry_buf)
-            .map_err(|e| Error::io("write hierarchy entry", e))?;
+    if actual_root_hier_offset != root_hier_offset {
+        return Err(Error::InvalidInput(format!(
+            "hierarchy offset accounting mismatch: at {actual_root_hier_offset}, expected {root_hier_offset}"
+        )));
     }
+    write_hierarchy_page_tree(&mut writer, &hierarchy_pages)?;
 
     writer
         .seek(SeekFrom::Start(copc_info_payload_start))
@@ -688,7 +711,7 @@ fn write_copc_inner<S: CopcPointSource>(
         halfsize,
         spacing: halfsize / 128.0,
         root_hier_offset,
-        root_hier_size: hierarchy_body_size,
+        root_hier_size: hierarchy_pages.byte_size,
         gpstime_min: point_stats.gpstime_min,
         gpstime_max: point_stats.gpstime_max,
     };
@@ -709,97 +732,446 @@ fn write_copc_inner<S: CopcPointSource>(
     Ok(())
 }
 
-fn build_lod_nodes<S: CopcPointSource>(
+#[derive(Debug)]
+struct HierarchyPagePlan {
+    key: VoxelKey,
+    items: Vec<HierarchyPageItem>,
+    offset: u64,
+    byte_size: u64,
+}
+
+#[derive(Debug)]
+enum HierarchyPageItem {
+    Point(Entry),
+    Child(Box<HierarchyPagePlan>),
+}
+
+fn plan_hierarchy_pages(entries: &[Entry], key: VoxelKey) -> Result<HierarchyPagePlan> {
+    if entries.is_empty() {
+        return Err(Error::InvalidInput(
+            "cannot write empty hierarchy page".into(),
+        ));
+    }
+    if entries.len() <= HIERARCHY_PAGE_MAX_ENTRIES {
+        return Ok(HierarchyPagePlan {
+            key,
+            items: entries
+                .iter()
+                .copied()
+                .map(HierarchyPageItem::Point)
+                .collect(),
+            offset: 0,
+            byte_size: 0,
+        });
+    }
+
+    let mut point_entry = None;
+    let mut child_entries: [Vec<Entry>; 8] = std::array::from_fn(|_| Vec::new());
+    for entry in entries.iter().copied() {
+        if entry.key == key {
+            point_entry = Some(entry);
+            continue;
+        }
+        let mut matched = false;
+        for (octant, child_entries) in child_entries.iter_mut().enumerate() {
+            let child_key = key.child(octant as u8);
+            if key_contains(child_key, entry.key) {
+                child_entries.push(entry);
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return Err(Error::InvalidInput(format!(
+                "hierarchy entry {:?} is not under page key {:?}",
+                entry.key, key
+            )));
+        }
+    }
+
+    let mut items = Vec::new();
+    if let Some(entry) = point_entry {
+        items.push(HierarchyPageItem::Point(entry));
+    }
+    for (octant, child_entries) in child_entries.into_iter().enumerate() {
+        if child_entries.is_empty() {
+            continue;
+        }
+        items.push(HierarchyPageItem::Child(Box::new(plan_hierarchy_pages(
+            &child_entries,
+            key.child(octant as u8),
+        )?)));
+    }
+    if items.len() > HIERARCHY_PAGE_MAX_ENTRIES {
+        return Err(Error::InvalidInput(format!(
+            "hierarchy page for {:?} has {} entries, max is {}",
+            key,
+            items.len(),
+            HIERARCHY_PAGE_MAX_ENTRIES
+        )));
+    }
+    Ok(HierarchyPagePlan {
+        key,
+        items,
+        offset: 0,
+        byte_size: 0,
+    })
+}
+
+fn assign_hierarchy_page_offsets(page: &mut HierarchyPagePlan, offset: u64) -> Result<u64> {
+    page.offset = offset;
+    page.byte_size = hierarchy_page_byte_size(page.items.len())?;
+    let mut next = offset
+        .checked_add(page.byte_size)
+        .ok_or_else(|| Error::InvalidInput("hierarchy page offset overflow".into()))?;
+    for item in &mut page.items {
+        if let HierarchyPageItem::Child(child) = item {
+            next = assign_hierarchy_page_offsets(child, next)?;
+        }
+    }
+    Ok(next)
+}
+
+fn hierarchy_page_byte_size(entry_count: usize) -> Result<u64> {
+    let bytes = entry_count
+        .checked_mul(HIERARCHY_ENTRY_BYTES)
+        .ok_or_else(|| Error::InvalidInput("hierarchy page size overflow".into()))?;
+    u64::try_from(bytes).map_err(|_| Error::InvalidInput("hierarchy page is too large".into()))
+}
+
+fn write_hierarchy_page_tree<W: Write + Seek>(
+    writer: &mut W,
+    page: &HierarchyPagePlan,
+) -> Result<()> {
+    let position = writer
+        .stream_position()
+        .map_err(|e| Error::io("record hierarchy page offset", e))?;
+    if position != page.offset {
+        return Err(Error::InvalidInput(format!(
+            "hierarchy page offset mismatch: at {position}, expected {}",
+            page.offset
+        )));
+    }
+    let mut entry_buf = [0u8; HIERARCHY_ENTRY_BYTES];
+    for item in &page.items {
+        hierarchy_page_item_entry(item)?.write_le(&mut entry_buf)?;
+        writer
+            .write_all(&entry_buf)
+            .map_err(|e| Error::io("write hierarchy entry", e))?;
+    }
+    for item in &page.items {
+        if let HierarchyPageItem::Child(child) = item {
+            write_hierarchy_page_tree(writer, child)?;
+        }
+    }
+    Ok(())
+}
+
+fn hierarchy_page_item_entry(item: &HierarchyPageItem) -> Result<Entry> {
+    match item {
+        HierarchyPageItem::Point(entry) => Ok(*entry),
+        HierarchyPageItem::Child(child) => Ok(Entry {
+            key: child.key,
+            offset: child.offset,
+            byte_size: i32::try_from(child.byte_size).map_err(|_| {
+                Error::InvalidInput("child hierarchy page exceeds COPC i32 byte size".into())
+            })?,
+            point_count: -1,
+        }),
+    }
+}
+
+fn key_contains(ancestor: VoxelKey, key: VoxelKey) -> bool {
+    if key.level < ancestor.level {
+        return false;
+    }
+    let shift = (key.level - ancestor.level) as u32;
+    (key.x >> shift) == ancestor.x
+        && (key.y >> shift) == ancestor.y
+        && (key.z >> shift) == ancestor.z
+}
+
+struct LodIndex {
+    nodes: Vec<LodNodeRange>,
+    order_path: TempPath,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LodNodeRange {
+    key: VoxelKey,
+    start: u64,
+    count: usize,
+}
+
+struct IndexRun {
+    path: TempPath,
+    start: u64,
+    count: usize,
+}
+
+fn build_lod_index<S: CopcPointSource>(
     source: &S,
     center: (f64, f64, f64),
     halfsize: f64,
     params: &CopcWriterParams,
     cancel: &dyn CancelCheck,
-) -> Result<Vec<(VoxelKey, Vec<u32>)>> {
+) -> Result<LodIndex> {
     cancel.check()?;
     let total_points = u32::try_from(source.len()).map_err(|_| {
         Error::InvalidInput("COPC writer supports at most u32::MAX points per file".into())
     })?;
     let max_points_per_node = params.max_points_per_node.max(1) as usize;
     let max_depth = params.max_depth.min(30);
-    let mut builder = LodNodeBuilder {
-        source,
-        max_points_per_node,
-        max_depth,
-        cancel,
-        nodes: Vec::new(),
-    };
-    builder.assign(
-        VoxelKey::root(),
-        (0..total_points).collect(),
-        Bounds::cube(center, halfsize),
-    )?;
-    let mut nodes = builder.nodes;
-    nodes.sort_by_key(|(key, _)| *key);
-    Ok(nodes)
+    let root_run = write_root_index_run(total_points, cancel)?;
+    let mut order_file = new_index_tempfile("order")?;
+    let mut order_offset = 0;
+    let mut nodes = Vec::new();
+    {
+        let mut order_writer = BufWriter::new(order_file.as_file_mut());
+        let mut builder = LodIndexBuilder {
+            source,
+            max_points_per_node,
+            max_depth,
+            cancel,
+            order_writer: &mut order_writer,
+            order_offset: &mut order_offset,
+            nodes: &mut nodes,
+        };
+        builder.assign(VoxelKey::root(), root_run, Bounds::cube(center, halfsize))?;
+        order_writer
+            .flush()
+            .map_err(|e| Error::io("flush LOD index order", e))?;
+    }
+    nodes.sort_by_key(|node| node.key);
+    Ok(LodIndex {
+        nodes,
+        order_path: order_file.into_temp_path(),
+    })
 }
 
-struct LodNodeBuilder<'a, S: CopcPointSource> {
+struct LodIndexBuilder<'a, S: CopcPointSource, W: Write> {
     source: &'a S,
     max_points_per_node: usize,
     max_depth: u32,
     cancel: &'a dyn CancelCheck,
-    nodes: Vec<(VoxelKey, Vec<u32>)>,
+    order_writer: &'a mut W,
+    order_offset: &'a mut u64,
+    nodes: &'a mut Vec<LodNodeRange>,
 }
 
-impl<S: CopcPointSource> LodNodeBuilder<'_, S> {
-    fn assign(&mut self, key: VoxelKey, indices: Vec<u32>, bounds: Bounds) -> Result<()> {
+impl<S: CopcPointSource, W: Write> LodIndexBuilder<'_, S, W> {
+    fn assign(&mut self, key: VoxelKey, run: IndexRun, bounds: Bounds) -> Result<()> {
         self.cancel.check()?;
-        if indices.is_empty() {
+        if run.count == 0 {
             return Ok(());
         }
-        if indices.len() <= self.max_points_per_node || key.level as u32 >= self.max_depth {
-            self.nodes.push((key, indices));
+        if run.count <= self.max_points_per_node || key.level as u32 >= self.max_depth {
+            let start = *self.order_offset;
+            append_index_run_to_order(&run, self.order_writer, self.order_offset, self.cancel)?;
+            self.nodes.push(LodNodeRange {
+                key,
+                start,
+                count: run.count,
+            });
             return Ok(());
         }
 
-        let mut children: [Vec<u32>; 8] = std::array::from_fn(|_| Vec::new());
-        for (partition_index, index) in indices.into_iter().enumerate() {
-            if partition_index % 16_384 == 0 {
-                self.cancel.check()?;
-            }
-            let (px, py, pz) = self.source.xyz(index as usize);
-            children[child_octant(bounds, px, py, pz)].push(index);
-        }
-        for child in &mut children {
-            child.reverse();
-        }
+        let mut children = partition_index_run(self.source, &run, bounds, self.cancel)?;
+        let start = *self.order_offset;
+        let selected_counts = append_lod_selection_to_order(
+            &children,
+            self.max_points_per_node,
+            self.order_writer,
+            self.order_offset,
+            self.cancel,
+        )?;
+        let selected_total = selected_counts.iter().sum();
+        self.nodes.push(LodNodeRange {
+            key,
+            start,
+            count: selected_total,
+        });
 
-        let mut selected = Vec::with_capacity(self.max_points_per_node);
-        while selected.len() < self.max_points_per_node {
-            let mut progressed = false;
-            for child in &mut children {
-                if let Some(index) = child.pop() {
-                    selected.push(index);
-                    progressed = true;
-                    if selected.len() == self.max_points_per_node {
-                        break;
-                    }
-                }
-            }
-            if !progressed {
-                break;
-            }
-        }
-        self.nodes.push((key, selected));
-
-        for (octant, child_indices) in children.into_iter().enumerate() {
-            if child_indices.is_empty() {
+        for (octant, child) in children.iter_mut().enumerate() {
+            let Some(mut child_run) = child.take() else {
+                continue;
+            };
+            let selected = selected_counts[octant];
+            if selected >= child_run.count {
                 continue;
             }
+            child_run.start += selected as u64 * INDEX_RECORD_BYTES;
+            child_run.count -= selected;
             self.assign(
                 key.child(octant as u8),
-                child_indices,
+                child_run,
                 bounds.octant(octant as u8),
             )?;
         }
         Ok(())
     }
+}
+
+fn write_root_index_run(total_points: u32, cancel: &dyn CancelCheck) -> Result<IndexRun> {
+    let mut writer = BufWriter::new(new_index_tempfile("root")?);
+    for index in 0..total_points {
+        if index as usize % CANCEL_POLL_STRIDE == 0 {
+            cancel.check()?;
+        }
+        writer
+            .write_u32::<LittleEndian>(index)
+            .map_err(|e| Error::io("write root LOD index", e))?;
+    }
+    let file = writer
+        .into_inner()
+        .map_err(|e| Error::io("flush root LOD index", e.into_error()))?;
+    Ok(IndexRun {
+        path: file.into_temp_path(),
+        start: 0,
+        count: total_points as usize,
+    })
+}
+
+fn partition_index_run<S: CopcPointSource>(
+    source: &S,
+    run: &IndexRun,
+    bounds: Bounds,
+    cancel: &dyn CancelCheck,
+) -> Result<[Option<IndexRun>; 8]> {
+    let mut reader = open_index_run(run)?;
+    let mut writers: [Option<BufWriter<NamedTempFile>>; 8] = std::array::from_fn(|_| None);
+    let mut counts = [0usize; 8];
+    for read_index in 0..run.count {
+        if read_index % CANCEL_POLL_STRIDE == 0 {
+            cancel.check()?;
+        }
+        let index = reader
+            .read_u32::<LittleEndian>()
+            .map_err(|e| Error::io("read LOD partition index", e))?;
+        let (x, y, z) = source.xyz(index as usize);
+        let octant = child_octant(bounds, x, y, z);
+        if writers[octant].is_none() {
+            writers[octant] = Some(BufWriter::new(new_index_tempfile("partition")?));
+        }
+        writers[octant]
+            .as_mut()
+            .expect("partition writer exists")
+            .write_u32::<LittleEndian>(index)
+            .map_err(|e| Error::io("write LOD partition index", e))?;
+        counts[octant] += 1;
+    }
+
+    let mut children: [Option<IndexRun>; 8] = std::array::from_fn(|_| None);
+    for octant in 0..8 {
+        let Some(writer) = writers[octant].take() else {
+            continue;
+        };
+        let file = writer
+            .into_inner()
+            .map_err(|e| Error::io("flush LOD partition index", e.into_error()))?;
+        children[octant] = Some(IndexRun {
+            path: file.into_temp_path(),
+            start: 0,
+            count: counts[octant],
+        });
+    }
+    Ok(children)
+}
+
+fn append_lod_selection_to_order<W: Write>(
+    children: &[Option<IndexRun>; 8],
+    max_points_per_node: usize,
+    order_writer: &mut W,
+    order_offset: &mut u64,
+    cancel: &dyn CancelCheck,
+) -> Result<[usize; 8]> {
+    let mut readers: [Option<BufReader<File>>; 8] = std::array::from_fn(|_| None);
+    for octant in 0..8 {
+        if let Some(child) = &children[octant] {
+            readers[octant] = Some(open_index_run(child)?);
+        }
+    }
+
+    let mut selected_counts = [0usize; 8];
+    let mut selected_total = 0usize;
+    while selected_total < max_points_per_node {
+        cancel.check()?;
+        let mut progressed = false;
+        for octant in 0..8 {
+            let Some(child) = &children[octant] else {
+                continue;
+            };
+            if selected_counts[octant] >= child.count {
+                continue;
+            }
+            let index = readers[octant]
+                .as_mut()
+                .expect("partition reader exists")
+                .read_u32::<LittleEndian>()
+                .map_err(|e| Error::io("read selected LOD index", e))?;
+            append_index_to_order(order_writer, order_offset, index)?;
+            selected_counts[octant] += 1;
+            selected_total += 1;
+            progressed = true;
+            if selected_total == max_points_per_node {
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    Ok(selected_counts)
+}
+
+fn append_index_run_to_order<W: Write>(
+    run: &IndexRun,
+    order_writer: &mut W,
+    order_offset: &mut u64,
+    cancel: &dyn CancelCheck,
+) -> Result<()> {
+    let mut reader = open_index_run(run)?;
+    for read_index in 0..run.count {
+        if read_index % CANCEL_POLL_STRIDE == 0 {
+            cancel.check()?;
+        }
+        let index = reader
+            .read_u32::<LittleEndian>()
+            .map_err(|e| Error::io("read LOD index", e))?;
+        append_index_to_order(order_writer, order_offset, index)?;
+    }
+    Ok(())
+}
+
+fn append_index_to_order<W: Write>(
+    order_writer: &mut W,
+    order_offset: &mut u64,
+    index: u32,
+) -> Result<()> {
+    order_writer
+        .write_u32::<LittleEndian>(index)
+        .map_err(|e| Error::io("write LOD index order", e))?;
+    *order_offset = order_offset
+        .checked_add(INDEX_RECORD_BYTES)
+        .ok_or_else(|| Error::InvalidInput("LOD index order exceeds u64 range".into()))?;
+    Ok(())
+}
+
+fn open_index_run(run: &IndexRun) -> Result<BufReader<File>> {
+    let path: &Path = run.path.as_ref();
+    let mut file = File::open(path).map_err(|e| Error::io("open LOD index", e))?;
+    file.seek(SeekFrom::Start(run.start))
+        .map_err(|e| Error::io("seek LOD index", e))?;
+    Ok(BufReader::new(file))
+}
+
+fn new_index_tempfile(label: &str) -> Result<NamedTempFile> {
+    let prefix = format!(".copc-writer-{label}.");
+    tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".idx")
+        .tempfile()
+        .map_err(|e| Error::io("create LOD index file", e))
 }
 
 fn child_octant(bounds: Bounds, x: f64, y: f64, z: f64) -> usize {
@@ -1058,4 +1430,155 @@ fn encode_point_record(
         .write_to(&mut cursor, format)
         .map_err(|e| Error::Las(format!("write point record: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct VecSource {
+        points: Vec<CopcPointFields>,
+    }
+
+    impl CopcPointSource for VecSource {
+        fn len(&self) -> usize {
+            self.points.len()
+        }
+
+        fn xyz(&self, index: usize) -> (f64, f64, f64) {
+            let point = self.points[index];
+            (point.x, point.y, point.z)
+        }
+
+        fn fields(&self, index: usize) -> Result<CopcPointFields> {
+            Ok(self.points[index])
+        }
+    }
+
+    #[test]
+    fn spooled_lod_index_covers_each_point_once() {
+        let points = (0..257)
+            .map(|i| CopcPointFields {
+                x: f64::from((i * 37) % 101),
+                y: f64::from((i * 53) % 103),
+                z: f64::from((i * 71) % 107),
+                intensity: 0,
+                return_number: 1,
+                number_of_returns: 1,
+                synthetic: 0,
+                key_point: 0,
+                withheld: 0,
+                overlap: 0,
+                scan_channel: 0,
+                scan_direction_flag: 0,
+                edge_of_flight_line: 0,
+                classification: 0,
+                user_data: 0,
+                scan_angle_rank: 0,
+                point_source_id: 0,
+                gps_time: f64::from(i),
+                red: 0,
+                green: 0,
+                blue: 0,
+            })
+            .collect();
+        let source = VecSource { points };
+        let bounds = source_bounds(&source);
+        let (center, halfsize) = cube_from_bounds(&bounds);
+        let params = CopcWriterParams {
+            max_points_per_node: 7,
+            max_depth: 5,
+        };
+
+        let spooled = build_lod_index(&source, center, halfsize, &params, &NeverCancel).unwrap();
+        let ranges = read_lod_index(&spooled).unwrap();
+
+        let mut seen = vec![false; source.len()];
+        let mut total = 0usize;
+        for (key, indices) in ranges {
+            if key.level < params.max_depth as i32 {
+                assert!(indices.len() <= params.max_points_per_node as usize);
+            }
+            for index in indices {
+                let seen = &mut seen[index as usize];
+                assert!(!*seen, "point index {index} was assigned more than once");
+                *seen = true;
+                total += 1;
+            }
+        }
+        assert_eq!(source.len(), total);
+        assert!(seen.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn hierarchy_plan_splits_large_root_page() {
+        let mut entries = vec![Entry {
+            key: VoxelKey::root(),
+            offset: 1,
+            byte_size: 1,
+            point_count: 1,
+        }];
+        let mut offset = 2;
+        for z in 0..16 {
+            for y in 0..16 {
+                for x in 0..16 {
+                    entries.push(Entry {
+                        key: VoxelKey { level: 4, x, y, z },
+                        offset,
+                        byte_size: 1,
+                        point_count: 1,
+                    });
+                    offset += 1;
+                }
+            }
+        }
+        entries.sort_by_key(|entry| entry.key);
+
+        let mut plan = plan_hierarchy_pages(&entries, VoxelKey::root()).unwrap();
+        let start = 1024;
+        let end = assign_hierarchy_page_offsets(&mut plan, start).unwrap();
+
+        assert!(plan.byte_size < hierarchy_page_byte_size(entries.len()).unwrap());
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| matches!(item, HierarchyPageItem::Child(_))));
+
+        let mut out = Cursor::new(vec![0; start as usize]);
+        out.seek(SeekFrom::Start(start)).unwrap();
+        write_hierarchy_page_tree(&mut out, &plan).unwrap();
+        assert_eq!(end, out.get_ref().len() as u64);
+    }
+
+    fn source_bounds(source: &VecSource) -> Bounds {
+        source.points.iter().fold(
+            Bounds::point(source.points[0].x, source.points[0].y, source.points[0].z),
+            |mut bounds, point| {
+                bounds.extend(point.x, point.y, point.z);
+                bounds
+            },
+        )
+    }
+
+    fn read_lod_index(index: &LodIndex) -> Result<Vec<(VoxelKey, Vec<u32>)>> {
+        let path: &Path = index.order_path.as_ref();
+        let mut reader =
+            BufReader::new(File::open(path).map_err(|e| Error::io("open LOD order", e))?);
+        let mut out = Vec::new();
+        for node in &index.nodes {
+            reader
+                .seek(SeekFrom::Start(node.start))
+                .map_err(|e| Error::io("seek LOD order", e))?;
+            let mut indices = Vec::with_capacity(node.count);
+            for _ in 0..node.count {
+                indices.push(
+                    reader
+                        .read_u32::<LittleEndian>()
+                        .map_err(|e| Error::io("read LOD order", e))?,
+                );
+            }
+            out.push((node.key, indices));
+        }
+        Ok(out)
+    }
 }
