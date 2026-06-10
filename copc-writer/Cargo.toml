@@ -14,11 +14,11 @@ categories = ["science", "encoding"]
 
 [dependencies]
 byteorder = { workspace = true }
-copc-core = { version = "0.1.0", path = "../copc-core" }
+copc-core = { version = "0.2.0", path = "../copc-core" }
 las = { workspace = true }
 laz = { workspace = true }
 memmap2 = { workspace = true }
 tempfile = { version = "3", default-features = false }
 
 [dev-dependencies]
-copc-reader = { version = "0.1.0", path = "../copc-reader" }
+copc-reader = { version = "0.2.0", path = "../copc-reader" }
