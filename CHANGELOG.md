@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-06-10
+
+- reject COPC files whose VLR/EVLR sections, hierarchy pages, or child hierarchy pages extend past EOF; cap VLR/EVLR counts at 4,096, one hierarchy page at 64 MiB, and recursively loaded hierarchy pages at 256 MiB; add truncation tests that assert errors instead of panics
+- make writer spill files private on Unix, ensure finalized and cancelled spill files are removed, and move `tempfile` into runtime dependencies
+- reject unsupported LAS-to-COPC conversions before lossy output, including NIR, waveform data, Extra Bytes, source VLRs/EVLRs, and padding that cannot yet be preserved
+- preserve source LAS metadata supported by the writer, including file source id, global encoding GPS time type, project GUID, generating software, creation date, scale, and offset
+- preserve fractional LAS 1.4 scan angles through streaming conversion and COPC writes
+- validate finite coordinates, quantized coordinate ranges, scan-angle encoding ranges, GPS time, bounds, transforms, and LAS point flag/channel fields before writing
+- store writer LOD indexes in spill-backed index files and split hierarchy output into 4,096-entry pages
+- emit COPC GPS time ranges and extended return histograms in output metadata
+- add COPC reader/writer conformance, malformed-input, field round-trip, and streaming-conversion regression tests
+- pin CI runner/toolchain versions, add an MSRV check, and verify package/publish dry-runs in CI
+- clear the LAS WKT global-encoding bit for generated files until CRS VLR preservation is implemented
+
 ## 0.1.0 - 2026-05-15
 
 - initial public release
