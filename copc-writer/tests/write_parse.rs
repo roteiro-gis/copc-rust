@@ -52,7 +52,7 @@ fn writer_output_parses_with_reader_hierarchy() {
             edge_of_flight_line: 0,
             classification: 2,
             user_data: 0,
-            scan_angle_rank: 0,
+            scan_angle: 0.0,
             point_source_id: 1,
             gps_time: 1.0e9 + i as f64,
             red: 0,
@@ -149,7 +149,7 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
             edge_of_flight_line: 0,
             classification: 7,
             user_data: 42,
-            scan_angle_rank: -30,
+            scan_angle: -30.25,
             point_source_id: 77,
             gps_time: 12345.5,
             red: 1000,
@@ -172,7 +172,7 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
             edge_of_flight_line: 1,
             classification: 9,
             user_data: 7,
-            scan_angle_rank: 15,
+            scan_angle: 15.5,
             point_source_id: 78,
             gps_time: 12346.25,
             red: 4000,
@@ -188,6 +188,10 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
     let path = dir.path().join("fields.copc.laz");
 
     write_source(&path, &source, true, bounds, &CopcWriterParams::default()).unwrap();
+
+    let header = read_las_header_prefix(&path);
+    assert_eq!(0, header.global_encoding);
+    assert_eq!(2, header.number_of_vlrs);
 
     let mut copc_reader = CopcReader::open(std::fs::File::open(&path).unwrap()).unwrap();
     let copc_points = copc_reader
@@ -394,7 +398,7 @@ fn writer_rejects_coordinate_outside_las_i32_range() {
 }
 
 #[test]
-fn streaming_conversion_preserves_scan_angle_degrees() {
+fn streaming_conversion_preserves_fractional_scan_angle_degrees() {
     let dir = tempfile::tempdir().unwrap();
     let las_path = dir.path().join("scan-angle.las");
     let copc_path = dir.path().join("scan-angle.copc.laz");
@@ -411,7 +415,7 @@ fn streaming_conversion_preserves_scan_angle_degrees() {
             z: 3.0,
             return_number: 1,
             number_of_returns: 1,
-            scan_angle: 30.0,
+            scan_angle: 30.25,
             gps_time: Some(1.0),
             ..Default::default()
         })
@@ -438,7 +442,7 @@ fn streaming_conversion_preserves_scan_angle_degrees() {
         .unwrap();
 
     assert_eq!(1, points.len());
-    assert_eq!(30.0, points[0].scan_angle);
+    assert_scan_angle_eq(30.25, points[0].scan_angle);
 }
 
 #[test]
@@ -481,7 +485,8 @@ fn streaming_conversion_preserves_supported_header_metadata() {
 
     let header = read_las_header_prefix(&copc_path);
     assert_eq!(42, header.file_source_id);
-    assert_eq!(25, header.global_encoding);
+    assert_eq!(9, header.global_encoding);
+    assert_eq!(2, header.number_of_vlrs);
     assert_eq!("source-system", header.system_identifier);
     assert_eq!("source-software", header.generating_software);
 }
@@ -710,6 +715,7 @@ fn streaming_writer_rejects_non_finite_record_coordinate() {
 struct LasHeaderPrefix {
     file_source_id: u16,
     global_encoding: u16,
+    number_of_vlrs: u32,
     system_identifier: String,
     generating_software: String,
 }
@@ -729,10 +735,13 @@ fn read_las_header_prefix(path: &std::path::Path) -> LasHeaderPrefix {
     file.read_exact(&mut system_identifier).unwrap();
     let mut generating_software = [0u8; 32];
     file.read_exact(&mut generating_software).unwrap();
+    file.seek(SeekFrom::Start(100)).unwrap();
+    let number_of_vlrs = file.read_u32::<LittleEndian>().unwrap();
 
     LasHeaderPrefix {
         file_source_id,
         global_encoding,
+        number_of_vlrs,
         system_identifier: trim_nuls(&system_identifier),
         generating_software: trim_nuls(&generating_software),
     }
@@ -782,7 +791,7 @@ fn assert_las_points_match_fields(expected: &[CopcPointFields], actual: &[Point]
         );
         assert_eq!(expected.classification, u8::from(actual.classification));
         assert_eq!(expected.user_data, actual.user_data);
-        assert_eq!(expected.scan_angle_rank as f32, actual.scan_angle);
+        assert_scan_angle_eq(expected.scan_angle, actual.scan_angle);
         assert_eq!(expected.point_source_id, actual.point_source_id);
         assert_eq!(Some(expected.gps_time), actual.gps_time);
         assert_eq!(
@@ -793,6 +802,13 @@ fn assert_las_points_match_fields(expected: &[CopcPointFields], actual: &[Point]
         assert_eq!(None, actual.nir);
         assert_eq!(None, actual.waveform);
     }
+}
+
+fn assert_scan_angle_eq(expected: f32, actual: f32) {
+    assert!(
+        (expected - actual).abs() <= 0.006,
+        "expected scan angle {expected}, got {actual}"
+    );
 }
 
 fn trim_nuls(bytes: &[u8]) -> String {
@@ -820,7 +836,7 @@ fn point_fields(x: f64, y: f64, z: f64) -> CopcPointFields {
         edge_of_flight_line: 0,
         classification: 0,
         user_data: 0,
-        scan_angle_rank: 0,
+        scan_angle: 0.0,
         point_source_id: 0,
         gps_time: 0.0,
         red: 0,
@@ -840,7 +856,7 @@ fn las_record(x: f64, y: f64, z: f64) -> copc_core::LasPointRecord {
         classification: 0,
         scan_direction_flag: false,
         edge_of_flight_line: false,
-        scan_angle: 0,
+        scan_angle: 0.0,
         user_data: 0,
         point_source_id: 0,
         synthetic: false,

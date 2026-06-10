@@ -16,7 +16,7 @@ use crate::spill::{SpillReader, SpillWriter};
 const CANCEL_POLL_STRIDE: usize = 4_096;
 const HIERARCHY_PAGE_MAX_ENTRIES: usize = 4_096;
 const INDEX_RECORD_BYTES: u64 = 4;
-const LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT: u16 = 16;
+const LAS_14_SCAN_ANGLE_SCALE: f32 = 0.006;
 const LASZIP_VLR_USER_ID: &str = "laszip encoded";
 const LASZIP_VLR_RECORD_ID: u16 = 22204;
 
@@ -39,7 +39,7 @@ pub struct CopcPointFields {
     pub classification: u8,
     pub user_data: u8,
     /// Scan angle in degrees; encoded as LAS 1.4 scaled scan angle on write.
-    pub scan_angle_rank: i16,
+    pub scan_angle: f32,
     pub point_source_id: u16,
     pub gps_time: f64,
     pub red: u16,
@@ -90,7 +90,7 @@ impl CopcPointSource for SpillSource<'_> {
             edge_of_flight_line: u8::from(record.edge_of_flight_line),
             classification: record.classification,
             user_data: record.user_data,
-            scan_angle_rank: record.scan_angle,
+            scan_angle: record.scan_angle,
             point_source_id: record.point_source_id,
             gps_time: record.gps_time,
             red: record.red,
@@ -117,7 +117,7 @@ impl Default for OutputLasMetadata {
     fn default() -> Self {
         Self {
             file_source_id: 0,
-            global_encoding: LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT,
+            global_encoding: 0,
             guid: [0; 16],
             system_identifier: "copc-rust".to_string(),
             generating_software: "copc-writer".to_string(),
@@ -131,8 +131,7 @@ impl Default for OutputLasMetadata {
 
 impl OutputLasMetadata {
     fn from_las_header(header: &las::Header) -> Self {
-        let mut global_encoding =
-            u16::from(header.gps_time_type()) | LAS_14_WKT_CRS_GLOBAL_ENCODING_BIT;
+        let mut global_encoding = u16::from(header.gps_time_type());
         if header.has_synthetic_return_numbers() {
             global_encoding |= 8;
         }
@@ -391,6 +390,7 @@ fn validate_coordinate_inputs<S: CopcPointSource>(
         let fields = source.fields(index)?;
         validate_xyz_finite(index, fields.x, fields.y, fields.z)?;
         quantize_xyz(index, fields.x, fields.y, fields.z, scale, offset)?;
+        validate_scan_angle(index, fields.scan_angle)?;
         validate_point_flags(index, &fields)?;
         stats.record(index, &fields)?;
     }
@@ -419,6 +419,21 @@ fn validate_point_flags(index: usize, fields: &CopcPointFields) -> Result<()> {
         0,
         1,
     )
+}
+
+fn validate_scan_angle(index: usize, value: f32) -> Result<()> {
+    if !value.is_finite() {
+        return Err(Error::InvalidInput(format!(
+            "point {index} scan_angle must be finite, got {value}"
+        )));
+    }
+    let scaled = value / LAS_14_SCAN_ANGLE_SCALE;
+    if scaled < f32::from(i16::MIN) || scaled > f32::from(i16::MAX) {
+        return Err(Error::InvalidInput(format!(
+            "point {index} scan_angle {value} encodes to {scaled}, outside LAS i16 range"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_point_field_range(index: usize, name: &str, value: u8, min: u8, max: u8) -> Result<()> {
@@ -1446,7 +1461,7 @@ fn encode_point_record(
                 | (fields.edge_of_flight_line << 7),
             fields.classification,
         ),
-        scan_angle: raw::point::ScanAngle::from(fields.scan_angle_rank as f32),
+        scan_angle: raw::point::ScanAngle::from(fields.scan_angle),
         user_data: fields.user_data,
         point_source_id: fields.point_source_id,
         gps_time: Some(fields.gps_time),
@@ -1505,7 +1520,7 @@ mod tests {
                 edge_of_flight_line: 0,
                 classification: 0,
                 user_data: 0,
-                scan_angle_rank: 0,
+                scan_angle: 0.0,
                 point_source_id: 0,
                 gps_time: f64::from(i),
                 red: 0,

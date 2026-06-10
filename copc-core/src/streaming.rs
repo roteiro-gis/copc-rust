@@ -16,7 +16,8 @@ pub struct LasPointRecord {
     pub classification: u8,
     pub scan_direction_flag: bool,
     pub edge_of_flight_line: bool,
-    pub scan_angle: i16,
+    /// Scan angle in degrees.
+    pub scan_angle: f32,
     pub user_data: u8,
     pub point_source_id: u16,
     pub synthetic: bool,
@@ -40,7 +41,7 @@ impl LasPointRecord {
     pub fn from_las_point(point: &las::Point) -> Self {
         let scan_direction_flag =
             matches!(point.scan_direction, las::point::ScanDirection::LeftToRight);
-        let scan_angle = point.scan_angle.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        let scan_angle = point.scan_angle;
         let (red, green, blue) = match point.color {
             Some(color) => (color.red, color.green, color.blue),
             None => (32_768, 32_768, 32_768),
@@ -134,7 +135,7 @@ impl StreamingLayout {
     }
 }
 
-const ALWAYS_BYTES: usize = 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 2 + 1 + 1 + 1 + 1 + 1;
+const ALWAYS_BYTES: usize = 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 1 + 4 + 1 + 2 + 1 + 1 + 1 + 1 + 1;
 const GPS_BYTES: usize = 8;
 const COLOR_BYTES: usize = 6;
 const NIR_BYTES: usize = 2;
@@ -154,7 +155,7 @@ pub fn serialize_le(record: &LasPointRecord, layout: &StreamingLayout, dst: &mut
     write_u8(&mut offset, dst, record.classification);
     write_u8(&mut offset, dst, u8::from(record.scan_direction_flag));
     write_u8(&mut offset, dst, u8::from(record.edge_of_flight_line));
-    write_i16(&mut offset, dst, record.scan_angle);
+    write_f32(&mut offset, dst, record.scan_angle);
     write_u8(&mut offset, dst, record.user_data);
     write_u16(&mut offset, dst, record.point_source_id);
     write_u8(&mut offset, dst, u8::from(record.synthetic));
@@ -205,7 +206,7 @@ pub fn deserialize_le(src: &[u8], layout: &StreamingLayout) -> io::Result<LasPoi
     let classification = read_u8(&mut offset, src);
     let scan_direction_flag = read_u8(&mut offset, src) != 0;
     let edge_of_flight_line = read_u8(&mut offset, src) != 0;
-    let scan_angle = read_i16(&mut offset, src);
+    let scan_angle = read_f32(&mut offset, src);
     let user_data = read_u8(&mut offset, src);
     let point_source_id = read_u16(&mut offset, src);
     let synthetic = read_u8(&mut offset, src) != 0;
@@ -291,12 +292,6 @@ fn write_u16(offset: &mut usize, dst: &mut [u8], value: u16) {
 }
 
 #[inline]
-fn write_i16(offset: &mut usize, dst: &mut [u8], value: i16) {
-    dst[*offset..*offset + 2].copy_from_slice(&value.to_le_bytes());
-    *offset += 2;
-}
-
-#[inline]
 fn write_u32(offset: &mut usize, dst: &mut [u8], value: u32) {
     dst[*offset..*offset + 4].copy_from_slice(&value.to_le_bytes());
     *offset += 4;
@@ -330,13 +325,6 @@ fn read_u8(offset: &mut usize, src: &[u8]) -> u8 {
 #[inline]
 fn read_u16(offset: &mut usize, src: &[u8]) -> u16 {
     let value = u16::from_le_bytes(src[*offset..*offset + 2].try_into().expect("u16 width"));
-    *offset += 2;
-    value
-}
-
-#[inline]
-fn read_i16(offset: &mut usize, src: &[u8]) -> i16 {
-    let value = i16::from_le_bytes(src[*offset..*offset + 2].try_into().expect("i16 width"));
     *offset += 2;
     value
 }
@@ -384,7 +372,7 @@ mod tests {
             classification: 7,
             scan_direction_flag: true,
             edge_of_flight_line: true,
-            scan_angle: -1234,
+            scan_angle: -12.34,
             user_data: 0x42,
             point_source_id: 0xCAFE,
             synthetic: true,
@@ -446,15 +434,15 @@ mod tests {
     }
 
     #[test]
-    fn from_las_point_preserves_scan_angle_degrees() {
+    fn from_las_point_preserves_fractional_scan_angle_degrees() {
         let point = las::Point {
-            scan_angle: 30.0,
+            scan_angle: 30.25,
             ..Default::default()
         };
 
         let record = LasPointRecord::from_las_point(&point);
 
-        assert_eq!(30, record.scan_angle);
+        assert_eq!(30.25, record.scan_angle);
     }
 
     #[test]

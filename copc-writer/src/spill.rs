@@ -217,7 +217,7 @@ mod tests {
             classification: (seed % 32) as u8,
             scan_direction_flag: seed % 2 == 0,
             edge_of_flight_line: seed % 3 == 0,
-            scan_angle: (seed as i16) - 100,
+            scan_angle: (seed as f32) - 100.25,
             user_data: (seed % 256) as u8,
             point_source_id: seed as u16,
             synthetic: seed % 4 == 0,

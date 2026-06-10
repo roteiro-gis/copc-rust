@@ -131,7 +131,7 @@ fn grid_points(count: usize) -> Vec<CopcPointFields> {
                 edge_of_flight_line: u8::from(i % 7 == 0),
                 classification: (i % 32) as u8,
                 user_data: (i % 251) as u8,
-                scan_angle_rank: (i as i16 % 180) - 90,
+                scan_angle: (i as f32 % 180.0) - 90.0,
                 point_source_id: (i % u16::MAX as usize) as u16,
                 gps_time: 1.0e9 + i as f64,
                 red: 0,
