@@ -4,6 +4,7 @@
 
 pub mod bounds;
 pub mod cancel;
+pub mod columns;
 pub mod error;
 pub mod hierarchy;
 pub mod info;
@@ -11,6 +12,7 @@ pub mod streaming;
 
 pub use bounds::Bounds;
 pub use cancel::{CancelCheck, NeverCancel};
+pub use columns::{ColumnData, ColumnSpec, ColumnView, LasColumnBatch, LasDimension, ScalarType};
 pub use error::{Error, Result};
 pub use hierarchy::{Entry, EntryAvailability, HierarchyPage, VoxelKey, HIERARCHY_ENTRY_BYTES};
 pub use info::CopcInfo;
