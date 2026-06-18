@@ -2,6 +2,8 @@
 
 use crate::{Error, Result};
 
+use las::point::Format as LasPointFormat;
+
 /// LAS/COPC point dimensions that can be represented as columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LasDimension {
@@ -71,6 +73,79 @@ impl LasDimension {
             Some(default) => default as u8 == scalar as u8,
             None => true,
         }
+    }
+}
+
+/// Requested LAS/COPC dimensions for column-oriented reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnSelection {
+    dimensions: Vec<LasDimension>,
+}
+
+impl ColumnSelection {
+    pub fn all() -> Self {
+        Self::from_dimensions([
+            LasDimension::X,
+            LasDimension::Y,
+            LasDimension::Z,
+            LasDimension::Intensity,
+            LasDimension::ReturnNumber,
+            LasDimension::NumberOfReturns,
+            LasDimension::Classification,
+            LasDimension::ScanDirectionFlag,
+            LasDimension::EdgeOfFlightLine,
+            LasDimension::ScanAngleRank,
+            LasDimension::UserData,
+            LasDimension::PointSourceId,
+            LasDimension::Synthetic,
+            LasDimension::KeyPoint,
+            LasDimension::Withheld,
+            LasDimension::Overlap,
+            LasDimension::ScanChannel,
+            LasDimension::GpsTime,
+            LasDimension::Red,
+            LasDimension::Green,
+            LasDimension::Blue,
+            LasDimension::Nir,
+            LasDimension::WaveformPacketDescriptorIndex,
+            LasDimension::WaveformPacketByteOffset,
+            LasDimension::WaveformPacketSize,
+            LasDimension::WavePacketReturnPointWaveformLocation,
+            LasDimension::ExtraBytes,
+        ])
+    }
+
+    pub fn xyz() -> Self {
+        Self::from_dimensions([LasDimension::X, LasDimension::Y, LasDimension::Z])
+    }
+
+    pub fn from_dimensions<I>(dims: I) -> Self
+    where
+        I: IntoIterator<Item = LasDimension>,
+    {
+        let mut dimensions = Vec::new();
+        for dim in dims {
+            if !dimensions.contains(&dim) {
+                dimensions.push(dim);
+            }
+        }
+        Self { dimensions }
+    }
+
+    pub fn contains(&self, dim: LasDimension) -> bool {
+        self.dimensions.contains(&dim)
+    }
+
+    pub fn dimensions(&self) -> &[LasDimension] {
+        &self.dimensions
+    }
+
+    pub fn len(&self) -> usize {
+        self.dimensions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dimensions.is_empty()
     }
 }
 
@@ -285,6 +360,80 @@ impl ColumnView<'_> {
     }
 }
 
+/// Returns the column layout available from a LAS point format.
+pub fn layout_for_las_format(format: LasPointFormat) -> Vec<ColumnSpec> {
+    let mut columns = Vec::with_capacity(27);
+
+    push_default_specs(
+        &mut columns,
+        [
+            LasDimension::X,
+            LasDimension::Y,
+            LasDimension::Z,
+            LasDimension::Intensity,
+            LasDimension::ReturnNumber,
+            LasDimension::NumberOfReturns,
+            LasDimension::Classification,
+            LasDimension::ScanDirectionFlag,
+            LasDimension::EdgeOfFlightLine,
+            LasDimension::ScanAngleRank,
+            LasDimension::UserData,
+            LasDimension::PointSourceId,
+            LasDimension::Synthetic,
+            LasDimension::KeyPoint,
+            LasDimension::Withheld,
+            LasDimension::Overlap,
+            LasDimension::ScanChannel,
+        ],
+    );
+
+    if format.has_gps_time {
+        columns.push(default_column_spec(LasDimension::GpsTime));
+    }
+    if format.has_color {
+        push_default_specs(
+            &mut columns,
+            [LasDimension::Red, LasDimension::Green, LasDimension::Blue],
+        );
+    }
+    if format.has_nir {
+        columns.push(default_column_spec(LasDimension::Nir));
+    }
+    if format.has_waveform {
+        push_default_specs(
+            &mut columns,
+            [
+                LasDimension::WaveformPacketDescriptorIndex,
+                LasDimension::WaveformPacketByteOffset,
+                LasDimension::WaveformPacketSize,
+                LasDimension::WavePacketReturnPointWaveformLocation,
+            ],
+        );
+    }
+    if format.extra_bytes > 0 {
+        columns.push(ColumnSpec::new(LasDimension::ExtraBytes, ScalarType::U8));
+    }
+
+    columns
+}
+
+/// Converts scan angle degrees into the rank-style column used by existing readers.
+pub fn scan_angle_rank_from_degrees(degrees: f32) -> i16 {
+    let scaled = (degrees * 180.0 / 90.0).round() as i32;
+    scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+fn push_default_specs<I>(columns: &mut Vec<ColumnSpec>, dims: I)
+where
+    I: IntoIterator<Item = LasDimension>,
+{
+    columns.extend(dims.into_iter().map(default_column_spec));
+}
+
+fn default_column_spec(dimension: LasDimension) -> ColumnSpec {
+    ColumnSpec::default_for(dimension).expect("fixed LAS dimension has a default scalar")
+}
+
 /// A column-oriented batch of LAS/COPC point values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LasColumnBatch {
@@ -357,6 +506,38 @@ impl LasColumnBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn base_layout_dims() -> Vec<LasDimension> {
+        vec![
+            LasDimension::X,
+            LasDimension::Y,
+            LasDimension::Z,
+            LasDimension::Intensity,
+            LasDimension::ReturnNumber,
+            LasDimension::NumberOfReturns,
+            LasDimension::Classification,
+            LasDimension::ScanDirectionFlag,
+            LasDimension::EdgeOfFlightLine,
+            LasDimension::ScanAngleRank,
+            LasDimension::UserData,
+            LasDimension::PointSourceId,
+            LasDimension::Synthetic,
+            LasDimension::KeyPoint,
+            LasDimension::Withheld,
+            LasDimension::Overlap,
+            LasDimension::ScanChannel,
+        ]
+    }
+
+    fn assert_layout_dims(format_id: u8, expected: Vec<LasDimension>) {
+        let format = LasPointFormat::new(format_id).unwrap();
+        let layout = layout_for_las_format(format);
+        let dims: Vec<_> = layout.iter().map(|spec| spec.dimension).collect();
+        assert_eq!(expected, dims, "format {format_id}");
+        for spec in layout {
+            spec.validate_default_scalar().unwrap();
+        }
+    }
 
     #[test]
     fn data_reports_len_and_scalar() {
@@ -435,6 +616,126 @@ mod tests {
             ColumnSpec::new(LasDimension::ScanAngleRank, ScalarType::F32)
                 .validate_default_scalar()
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn selection_tracks_requested_dimensions() {
+        let xyz = ColumnSelection::xyz();
+        assert_eq!(
+            &[LasDimension::X, LasDimension::Y, LasDimension::Z],
+            xyz.dimensions()
+        );
+        assert!(xyz.contains(LasDimension::X));
+        assert!(!xyz.contains(LasDimension::Intensity));
+
+        let selection = ColumnSelection::from_dimensions([
+            LasDimension::Intensity,
+            LasDimension::X,
+            LasDimension::Intensity,
+        ]);
+        assert_eq!(
+            &[LasDimension::Intensity, LasDimension::X],
+            selection.dimensions()
+        );
+        assert_eq!(2, selection.len());
+        assert!(!selection.is_empty());
+
+        let all = ColumnSelection::all();
+        assert!(all.contains(LasDimension::WaveformPacketByteOffset));
+        assert!(all.contains(LasDimension::ExtraBytes));
+    }
+
+    #[test]
+    fn scan_angle_rank_uses_engine_conversion() {
+        assert_eq!(0, scan_angle_rank_from_degrees(0.0));
+        assert_eq!(91, scan_angle_rank_from_degrees(45.25));
+        assert_eq!(-91, scan_angle_rank_from_degrees(-45.25));
+        assert_eq!(i16::MAX, scan_angle_rank_from_degrees(f32::MAX));
+        assert_eq!(i16::MIN, scan_angle_rank_from_degrees(f32::MIN));
+    }
+
+    #[test]
+    fn layout_for_format_0_has_core_dimensions() {
+        assert_layout_dims(0, base_layout_dims());
+    }
+
+    #[test]
+    fn layout_for_format_3_adds_gps_and_color() {
+        let mut expected = base_layout_dims();
+        expected.extend([
+            LasDimension::GpsTime,
+            LasDimension::Red,
+            LasDimension::Green,
+            LasDimension::Blue,
+        ]);
+
+        assert_layout_dims(3, expected);
+    }
+
+    #[test]
+    fn layout_for_format_6_adds_gps() {
+        let mut expected = base_layout_dims();
+        expected.push(LasDimension::GpsTime);
+
+        assert_layout_dims(6, expected);
+    }
+
+    #[test]
+    fn layout_for_format_7_adds_gps_and_color() {
+        let mut expected = base_layout_dims();
+        expected.extend([
+            LasDimension::GpsTime,
+            LasDimension::Red,
+            LasDimension::Green,
+            LasDimension::Blue,
+        ]);
+
+        assert_layout_dims(7, expected);
+    }
+
+    #[test]
+    fn layout_for_format_8_adds_gps_color_and_nir() {
+        let mut expected = base_layout_dims();
+        expected.extend([
+            LasDimension::GpsTime,
+            LasDimension::Red,
+            LasDimension::Green,
+            LasDimension::Blue,
+            LasDimension::Nir,
+        ]);
+
+        assert_layout_dims(8, expected);
+    }
+
+    #[test]
+    fn layout_for_format_10_adds_all_optional_las_dimensions() {
+        let mut expected = base_layout_dims();
+        expected.extend([
+            LasDimension::GpsTime,
+            LasDimension::Red,
+            LasDimension::Green,
+            LasDimension::Blue,
+            LasDimension::Nir,
+            LasDimension::WaveformPacketDescriptorIndex,
+            LasDimension::WaveformPacketByteOffset,
+            LasDimension::WaveformPacketSize,
+            LasDimension::WavePacketReturnPointWaveformLocation,
+        ]);
+
+        assert_layout_dims(10, expected);
+    }
+
+    #[test]
+    fn layout_includes_extra_bytes_when_format_declares_them() {
+        let mut format = LasPointFormat::new(0).unwrap();
+        format.extra_bytes = 4;
+
+        let layout = layout_for_las_format(format);
+
+        assert_eq!(
+            Some(&ColumnSpec::new(LasDimension::ExtraBytes, ScalarType::U8)),
+            layout.last()
         );
     }
 }
