@@ -12,7 +12,10 @@ pub mod streaming;
 
 pub use bounds::Bounds;
 pub use cancel::{CancelCheck, NeverCancel};
-pub use columns::{ColumnData, ColumnSpec, ColumnView, LasColumnBatch, LasDimension, ScalarType};
+pub use columns::{
+    layout_for_las_format, scan_angle_rank_from_degrees, ColumnData, ColumnSelection, ColumnSpec,
+    ColumnView, LasColumnBatch, LasDimension, ScalarType,
+};
 pub use error::{Error, Result};
 pub use hierarchy::{Entry, EntryAvailability, HierarchyPage, VoxelKey, HIERARCHY_ENTRY_BYTES};
 pub use info::CopcInfo;
