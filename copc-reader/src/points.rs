@@ -276,81 +276,101 @@ fn append_columns(
         las::point::ScanDirection::LeftToRight
     );
     let scan_angle_rank = scan_angle_rank_from_degrees(f32::from(raw_point.scan_angle));
+    let context = ColumnAppendContext {
+        raw_point,
+        xyz,
+        flags,
+        classification,
+        is_overlap,
+        scan_direction_flag,
+        scan_angle_rank,
+    };
 
     for (spec, data) in columns {
-        append_column(
-            spec.dimension,
-            data,
-            raw_point,
-            xyz,
-            &flags,
-            classification,
-            is_overlap,
-            scan_direction_flag,
-            scan_angle_rank,
-        )?;
+        append_column(spec.dimension, data, &context)?;
     }
     Ok(())
+}
+
+struct ColumnAppendContext<'a> {
+    raw_point: &'a las::raw::Point,
+    xyz: (f64, f64, f64),
+    flags: las::raw::point::Flags,
+    classification: u8,
+    is_overlap: bool,
+    scan_direction_flag: bool,
+    scan_angle_rank: i16,
 }
 
 fn append_column(
     dimension: LasDimension,
     data: &mut ColumnData,
-    raw_point: &las::raw::Point,
-    xyz: (f64, f64, f64),
-    flags: &las::raw::point::Flags,
-    classification: u8,
-    is_overlap: bool,
-    scan_direction_flag: bool,
-    scan_angle_rank: i16,
+    context: &ColumnAppendContext<'_>,
 ) -> Result<()> {
     let scalar = data.scalar();
     match (dimension, data) {
-        (LasDimension::X, ColumnData::F64(values)) => values.push(xyz.0),
-        (LasDimension::Y, ColumnData::F64(values)) => values.push(xyz.1),
-        (LasDimension::Z, ColumnData::F64(values)) => values.push(xyz.2),
-        (LasDimension::Intensity, ColumnData::U16(values)) => values.push(raw_point.intensity),
+        (LasDimension::X, ColumnData::F64(values)) => values.push(context.xyz.0),
+        (LasDimension::Y, ColumnData::F64(values)) => values.push(context.xyz.1),
+        (LasDimension::Z, ColumnData::F64(values)) => values.push(context.xyz.2),
+        (LasDimension::Intensity, ColumnData::U16(values)) => {
+            values.push(context.raw_point.intensity);
+        }
         (LasDimension::ReturnNumber, ColumnData::U8(values)) => {
-            values.push(flags.return_number());
+            values.push(context.flags.return_number());
         }
         (LasDimension::NumberOfReturns, ColumnData::U8(values)) => {
-            values.push(flags.number_of_returns());
+            values.push(context.flags.number_of_returns());
         }
-        (LasDimension::Classification, ColumnData::U8(values)) => values.push(classification),
+        (LasDimension::Classification, ColumnData::U8(values)) => {
+            values.push(context.classification);
+        }
         (LasDimension::ScanDirectionFlag, ColumnData::Bool(values)) => {
-            values.push(scan_direction_flag);
+            values.push(context.scan_direction_flag);
         }
         (LasDimension::EdgeOfFlightLine, ColumnData::Bool(values)) => {
-            values.push(flags.is_edge_of_flight_line());
+            values.push(context.flags.is_edge_of_flight_line());
         }
-        (LasDimension::ScanAngleRank, ColumnData::I16(values)) => values.push(scan_angle_rank),
-        (LasDimension::UserData, ColumnData::U8(values)) => values.push(raw_point.user_data),
+        (LasDimension::ScanAngleRank, ColumnData::I16(values)) => {
+            values.push(context.scan_angle_rank);
+        }
+        (LasDimension::UserData, ColumnData::U8(values)) => {
+            values.push(context.raw_point.user_data);
+        }
         (LasDimension::PointSourceId, ColumnData::U16(values)) => {
-            values.push(raw_point.point_source_id);
+            values.push(context.raw_point.point_source_id);
         }
-        (LasDimension::Synthetic, ColumnData::Bool(values)) => values.push(flags.is_synthetic()),
-        (LasDimension::KeyPoint, ColumnData::Bool(values)) => values.push(flags.is_key_point()),
-        (LasDimension::Withheld, ColumnData::Bool(values)) => values.push(flags.is_withheld()),
-        (LasDimension::Overlap, ColumnData::Bool(values)) => values.push(is_overlap),
-        (LasDimension::ScanChannel, ColumnData::U8(values)) => values.push(flags.scanner_channel()),
+        (LasDimension::Synthetic, ColumnData::Bool(values)) => {
+            values.push(context.flags.is_synthetic());
+        }
+        (LasDimension::KeyPoint, ColumnData::Bool(values)) => {
+            values.push(context.flags.is_key_point());
+        }
+        (LasDimension::Withheld, ColumnData::Bool(values)) => {
+            values.push(context.flags.is_withheld());
+        }
+        (LasDimension::Overlap, ColumnData::Bool(values)) => values.push(context.is_overlap),
+        (LasDimension::ScanChannel, ColumnData::U8(values)) => {
+            values.push(context.flags.scanner_channel());
+        }
         (LasDimension::GpsTime, ColumnData::F64(values)) => {
-            values.push(raw_point.gps_time.unwrap_or(0.0));
+            values.push(context.raw_point.gps_time.unwrap_or(0.0));
         }
         (LasDimension::Red, ColumnData::U16(values)) => {
-            values.push(raw_point.color.unwrap_or_default().red);
+            values.push(context.raw_point.color.unwrap_or_default().red);
         }
         (LasDimension::Green, ColumnData::U16(values)) => {
-            values.push(raw_point.color.unwrap_or_default().green);
+            values.push(context.raw_point.color.unwrap_or_default().green);
         }
         (LasDimension::Blue, ColumnData::U16(values)) => {
-            values.push(raw_point.color.unwrap_or_default().blue);
+            values.push(context.raw_point.color.unwrap_or_default().blue);
         }
         (LasDimension::Nir, ColumnData::U16(values)) => {
-            values.push(raw_point.nir.unwrap_or(0));
+            values.push(context.raw_point.nir.unwrap_or(0));
         }
         (LasDimension::WaveformPacketDescriptorIndex, ColumnData::U8(values)) => {
             values.push(
-                raw_point
+                context
+                    .raw_point
                     .waveform
                     .unwrap_or_default()
                     .wave_packet_descriptor_index,
@@ -358,7 +378,8 @@ fn append_column(
         }
         (LasDimension::WaveformPacketByteOffset, ColumnData::U64(values)) => {
             values.push(
-                raw_point
+                context
+                    .raw_point
                     .waveform
                     .unwrap_or_default()
                     .byte_offset_to_waveform_data,
@@ -366,7 +387,8 @@ fn append_column(
         }
         (LasDimension::WaveformPacketSize, ColumnData::U32(values)) => {
             values.push(
-                raw_point
+                context
+                    .raw_point
                     .waveform
                     .unwrap_or_default()
                     .waveform_packet_size_in_bytes,
@@ -374,14 +396,15 @@ fn append_column(
         }
         (LasDimension::WavePacketReturnPointWaveformLocation, ColumnData::F32(values)) => {
             values.push(
-                raw_point
+                context
+                    .raw_point
                     .waveform
                     .unwrap_or_default()
                     .return_point_waveform_location,
             );
         }
         (LasDimension::ExtraBytes, ColumnData::U8(values)) => {
-            values.push(raw_point.extra_bytes.first().copied().unwrap_or(0));
+            values.push(context.raw_point.extra_bytes.first().copied().unwrap_or(0));
         }
         _ => {
             return Err(Error::InvalidData(format!(
