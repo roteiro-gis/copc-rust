@@ -2,7 +2,10 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use copc_core::{Bounds, CancelCheck, CopcInfo, Entry, Error, Result};
+use copc_core::{
+    layout_for_las_format, scan_angle_rank_from_degrees, Bounds, CancelCheck, ColumnData,
+    ColumnSelection, ColumnSpec, CopcInfo, Entry, Error, LasColumnBatch, LasDimension, Result,
+};
 use las::point::Format as LasPointFormat;
 use las::{Point, Transform, Vector};
 use laz::record::{LayeredPointRecordDecompressor, RecordDecompressor};
@@ -119,6 +122,275 @@ impl<R: Read + Seek + Send> CopcReader<R> {
             Some(cancel),
         )
     }
+
+    pub fn read_columns(
+        &mut self,
+        query: PointQuery,
+        selection: ColumnSelection,
+    ) -> Result<LasColumnBatch> {
+        self.read_columns_inner(query, selection, None)
+    }
+
+    pub fn read_columns_with_cancel(
+        &mut self,
+        query: PointQuery,
+        selection: ColumnSelection,
+        cancel: &dyn CancelCheck,
+    ) -> Result<LasColumnBatch> {
+        self.read_columns_inner(query, selection, Some(cancel))
+    }
+
+    fn read_columns_inner(
+        &mut self,
+        query: PointQuery,
+        selection: ColumnSelection,
+        cancel: Option<&dyn CancelCheck>,
+    ) -> Result<LasColumnBatch> {
+        let chunks = select_point_chunks(&self.file, query)?;
+        let point_format = self.file.point_format()?;
+        let transforms = self.file.transforms();
+        let bounds = match query.bounds {
+            BoundsSelection::All => None,
+            BoundsSelection::Within(bounds) => Some(bounds),
+        };
+        let mut decoder = ChunkLazDecoder::new(&mut self.source, self.file.laszip_vlr().clone())?;
+        let expected_record_size = usize::from(point_format.len());
+        if decoder.record_size() != expected_record_size {
+            return Err(Error::InvalidData(format!(
+                "LASzip item size is {} bytes, but LAS point record length is {} bytes",
+                decoder.record_size(),
+                expected_record_size
+            )));
+        }
+
+        let capacity = match bounds {
+            Some(_) => 0,
+            None => total_candidate_points(&chunks)?,
+        };
+        let mut columns = selected_column_builders(point_format, selection, capacity)?;
+        let mut point_buf = vec![0u8; expected_record_size];
+        let mut decoded_points = 0usize;
+        let mut accepted_points = 0usize;
+
+        for entry in chunks {
+            if entry.point_count <= 0 {
+                continue;
+            }
+            decoder.seek_to_chunk(entry.offset)?;
+            let points_in_chunk = usize::try_from(entry.point_count).map_err(|_| {
+                Error::InvalidData(format!(
+                    "negative point count {} for {:?}",
+                    entry.point_count, entry.key
+                ))
+            })?;
+            for _ in 0..points_in_chunk {
+                if decoded_points % CANCEL_POLL_STRIDE == 0 {
+                    if let Some(cancel) = cancel {
+                        cancel.check()?;
+                    }
+                }
+
+                decoder.decompress_one(&mut point_buf)?;
+                decoded_points += 1;
+
+                let raw_point = las::raw::Point::read_from(point_buf.as_slice(), &point_format)
+                    .map_err(|e| Error::Las(e.to_string()))?;
+                let x = transforms.x.direct(raw_point.x);
+                let y = transforms.y.direct(raw_point.y);
+                let z = transforms.z.direct(raw_point.z);
+                if let Some(bounds) = bounds {
+                    if !bounds.contains_xyz(x, y, z) {
+                        continue;
+                    }
+                }
+
+                append_columns(&mut columns, &raw_point, (x, y, z))?;
+                accepted_points += 1;
+            }
+        }
+
+        let batch = LasColumnBatch {
+            len: accepted_points,
+            columns,
+        };
+        batch.validate()?;
+        Ok(batch)
+    }
+}
+
+fn selected_column_builders(
+    point_format: LasPointFormat,
+    selection: ColumnSelection,
+    capacity: usize,
+) -> Result<Vec<(ColumnSpec, ColumnData)>> {
+    layout_for_las_format(point_format)
+        .into_iter()
+        .filter(|spec| selection.contains(spec.dimension))
+        .map(|spec| empty_column(spec, capacity, point_format.extra_bytes))
+        .collect()
+}
+
+fn empty_column(
+    spec: ColumnSpec,
+    capacity: usize,
+    extra_bytes: u16,
+) -> Result<(ColumnSpec, ColumnData)> {
+    let data = match spec.scalar {
+        copc_core::ScalarType::F64 => ColumnData::F64(Vec::with_capacity(capacity)),
+        copc_core::ScalarType::F32 => ColumnData::F32(Vec::with_capacity(capacity)),
+        copc_core::ScalarType::I64 => ColumnData::I64(Vec::with_capacity(capacity)),
+        copc_core::ScalarType::I32 => ColumnData::I32(Vec::with_capacity(capacity)),
+        copc_core::ScalarType::I16 => ColumnData::I16(Vec::with_capacity(capacity)),
+        copc_core::ScalarType::I8 => ColumnData::I8(Vec::with_capacity(capacity)),
+        copc_core::ScalarType::U64 => ColumnData::U64(Vec::with_capacity(capacity)),
+        copc_core::ScalarType::U32 => ColumnData::U32(Vec::with_capacity(capacity)),
+        copc_core::ScalarType::U16 => ColumnData::U16(Vec::with_capacity(capacity)),
+        copc_core::ScalarType::U8 => {
+            if spec.dimension == LasDimension::ExtraBytes && extra_bytes > 1 {
+                return Err(Error::Unsupported(format!(
+                    "materialized ExtraBytes columns require one byte per point, got {extra_bytes}"
+                )));
+            }
+            ColumnData::U8(Vec::with_capacity(capacity))
+        }
+        copc_core::ScalarType::Bool => ColumnData::Bool(Vec::with_capacity(capacity)),
+    };
+    Ok((spec, data))
+}
+
+fn append_columns(
+    columns: &mut [(ColumnSpec, ColumnData)],
+    raw_point: &las::raw::Point,
+    xyz: (f64, f64, f64),
+) -> Result<()> {
+    let mut flags = raw_point.flags;
+    let is_overlap = flags.is_overlap();
+    flags.clear_overlap_class();
+    let classification = u8::from(
+        flags
+            .to_classification()
+            .map_err(|e| Error::Las(e.to_string()))?,
+    );
+    let scan_direction_flag = matches!(
+        flags.scan_direction(),
+        las::point::ScanDirection::LeftToRight
+    );
+    let scan_angle_rank = scan_angle_rank_from_degrees(f32::from(raw_point.scan_angle));
+
+    for (spec, data) in columns {
+        append_column(
+            spec.dimension,
+            data,
+            raw_point,
+            xyz,
+            &flags,
+            classification,
+            is_overlap,
+            scan_direction_flag,
+            scan_angle_rank,
+        )?;
+    }
+    Ok(())
+}
+
+fn append_column(
+    dimension: LasDimension,
+    data: &mut ColumnData,
+    raw_point: &las::raw::Point,
+    xyz: (f64, f64, f64),
+    flags: &las::raw::point::Flags,
+    classification: u8,
+    is_overlap: bool,
+    scan_direction_flag: bool,
+    scan_angle_rank: i16,
+) -> Result<()> {
+    let scalar = data.scalar();
+    match (dimension, data) {
+        (LasDimension::X, ColumnData::F64(values)) => values.push(xyz.0),
+        (LasDimension::Y, ColumnData::F64(values)) => values.push(xyz.1),
+        (LasDimension::Z, ColumnData::F64(values)) => values.push(xyz.2),
+        (LasDimension::Intensity, ColumnData::U16(values)) => values.push(raw_point.intensity),
+        (LasDimension::ReturnNumber, ColumnData::U8(values)) => {
+            values.push(flags.return_number());
+        }
+        (LasDimension::NumberOfReturns, ColumnData::U8(values)) => {
+            values.push(flags.number_of_returns());
+        }
+        (LasDimension::Classification, ColumnData::U8(values)) => values.push(classification),
+        (LasDimension::ScanDirectionFlag, ColumnData::Bool(values)) => {
+            values.push(scan_direction_flag);
+        }
+        (LasDimension::EdgeOfFlightLine, ColumnData::Bool(values)) => {
+            values.push(flags.is_edge_of_flight_line());
+        }
+        (LasDimension::ScanAngleRank, ColumnData::I16(values)) => values.push(scan_angle_rank),
+        (LasDimension::UserData, ColumnData::U8(values)) => values.push(raw_point.user_data),
+        (LasDimension::PointSourceId, ColumnData::U16(values)) => {
+            values.push(raw_point.point_source_id);
+        }
+        (LasDimension::Synthetic, ColumnData::Bool(values)) => values.push(flags.is_synthetic()),
+        (LasDimension::KeyPoint, ColumnData::Bool(values)) => values.push(flags.is_key_point()),
+        (LasDimension::Withheld, ColumnData::Bool(values)) => values.push(flags.is_withheld()),
+        (LasDimension::Overlap, ColumnData::Bool(values)) => values.push(is_overlap),
+        (LasDimension::ScanChannel, ColumnData::U8(values)) => values.push(flags.scanner_channel()),
+        (LasDimension::GpsTime, ColumnData::F64(values)) => {
+            values.push(raw_point.gps_time.unwrap_or(0.0));
+        }
+        (LasDimension::Red, ColumnData::U16(values)) => {
+            values.push(raw_point.color.unwrap_or_default().red);
+        }
+        (LasDimension::Green, ColumnData::U16(values)) => {
+            values.push(raw_point.color.unwrap_or_default().green);
+        }
+        (LasDimension::Blue, ColumnData::U16(values)) => {
+            values.push(raw_point.color.unwrap_or_default().blue);
+        }
+        (LasDimension::Nir, ColumnData::U16(values)) => {
+            values.push(raw_point.nir.unwrap_or(0));
+        }
+        (LasDimension::WaveformPacketDescriptorIndex, ColumnData::U8(values)) => {
+            values.push(
+                raw_point
+                    .waveform
+                    .unwrap_or_default()
+                    .wave_packet_descriptor_index,
+            );
+        }
+        (LasDimension::WaveformPacketByteOffset, ColumnData::U64(values)) => {
+            values.push(
+                raw_point
+                    .waveform
+                    .unwrap_or_default()
+                    .byte_offset_to_waveform_data,
+            );
+        }
+        (LasDimension::WaveformPacketSize, ColumnData::U32(values)) => {
+            values.push(
+                raw_point
+                    .waveform
+                    .unwrap_or_default()
+                    .waveform_packet_size_in_bytes,
+            );
+        }
+        (LasDimension::WavePacketReturnPointWaveformLocation, ColumnData::F32(values)) => {
+            values.push(
+                raw_point
+                    .waveform
+                    .unwrap_or_default()
+                    .return_point_waveform_location,
+            );
+        }
+        (LasDimension::ExtraBytes, ColumnData::U8(values)) => {
+            values.push(raw_point.extra_bytes.first().copied().unwrap_or(0));
+        }
+        _ => {
+            return Err(Error::InvalidData(format!(
+                "column {:?} has incompatible data type {:?}",
+                dimension, scalar
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Iterator over selected COPC point chunks.

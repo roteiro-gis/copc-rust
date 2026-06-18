@@ -20,6 +20,9 @@ use copc_core::{
 use las::{Transform, Vector};
 use laz::LazVlr;
 
+pub use copc_core::{
+    ColumnData, ColumnSelection, ColumnSpec, ColumnView, LasColumnBatch, LasDimension, ScalarType,
+};
 pub use points::{BoundsSelection, CopcReader, LodSelection, PointIter, PointQuery};
 
 const LAS_HEADER_SIZE_14: u16 = 375;
