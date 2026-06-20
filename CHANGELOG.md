@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- add LAS/COPC-native column types in `copc-core`, materialized column reads in
+  `copc-reader`, and a `copc-writer` `ColumnBatchSource` adapter for writing
+  neutral `LasColumnBatch` values directly
+- keep row iteration supported while documenting that column reads are owned,
+  materialized buffers decoded from compressed LAZ chunks, not zero-copy views
+  into COPC files
+- keep Arrow/DataFusion conversion out of `copc-rust`; downstream engines can
+  adapt `LasColumnBatch` into their own models or a future optional feature can
+  add Arrow-specific conversion
+
 ## 0.2.0 - 2026-06-10
 
 - reject COPC files whose VLR/EVLR sections, hierarchy pages, or child hierarchy pages extend past EOF; cap VLR/EVLR counts at 4,096, one hierarchy page at 64 MiB, and recursively loaded hierarchy pages at 256 MiB; add truncation tests that assert errors instead of panics

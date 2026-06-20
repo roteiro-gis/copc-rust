@@ -4,8 +4,8 @@ use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use copc_core::{
-    Bounds, CancelCheck, CopcInfo, Entry, Error, LasPointRecord, NeverCancel, Result,
-    StreamingLayout, VoxelKey, HIERARCHY_ENTRY_BYTES,
+    Bounds, CancelCheck, ColumnData, CopcInfo, Entry, Error, LasColumnBatch, LasDimension,
+    LasPointRecord, NeverCancel, Result, StreamingLayout, VoxelKey, HIERARCHY_ENTRY_BYTES,
 };
 use las::{point::Format as LasFormat, raw, Color, Read as _};
 use laz::{LasZipCompressor, LazVlrBuilder};
@@ -56,6 +56,245 @@ pub trait CopcPointSource {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// COPC writer source backed directly by a neutral LAS column batch.
+pub struct ColumnBatchSource<'a> {
+    batch: &'a LasColumnBatch,
+    x: &'a [f64],
+    y: &'a [f64],
+    z: &'a [f64],
+    intensity: Option<&'a [u16]>,
+    return_number: Option<&'a [u8]>,
+    number_of_returns: Option<&'a [u8]>,
+    synthetic: Option<&'a [bool]>,
+    key_point: Option<&'a [bool]>,
+    withheld: Option<&'a [bool]>,
+    overlap: Option<&'a [bool]>,
+    scan_channel: Option<&'a [u8]>,
+    scan_direction_flag: Option<&'a [bool]>,
+    edge_of_flight_line: Option<&'a [bool]>,
+    classification: Option<&'a [u8]>,
+    user_data: Option<&'a [u8]>,
+    scan_angle_rank: Option<&'a [i16]>,
+    point_source_id: Option<&'a [u16]>,
+    gps_time: Option<&'a [f64]>,
+    red: Option<&'a [u16]>,
+    green: Option<&'a [u16]>,
+    blue: Option<&'a [u16]>,
+}
+
+impl<'a> ColumnBatchSource<'a> {
+    pub fn new(batch: &'a LasColumnBatch) -> Result<Self> {
+        batch.validate()?;
+        validate_column_batch_writer_support(batch)?;
+
+        let x = required_f64_column(batch, LasDimension::X)?;
+        let y = required_f64_column(batch, LasDimension::Y)?;
+        let z = required_f64_column(batch, LasDimension::Z)?;
+        let red = optional_u16_column(batch, LasDimension::Red)?;
+        let green = optional_u16_column(batch, LasDimension::Green)?;
+        let blue = optional_u16_column(batch, LasDimension::Blue)?;
+        validate_color_columns(red, green, blue)?;
+
+        Ok(Self {
+            batch,
+            x,
+            y,
+            z,
+            intensity: optional_u16_column(batch, LasDimension::Intensity)?,
+            return_number: optional_u8_column(batch, LasDimension::ReturnNumber)?,
+            number_of_returns: optional_u8_column(batch, LasDimension::NumberOfReturns)?,
+            synthetic: optional_bool_column(batch, LasDimension::Synthetic)?,
+            key_point: optional_bool_column(batch, LasDimension::KeyPoint)?,
+            withheld: optional_bool_column(batch, LasDimension::Withheld)?,
+            overlap: optional_bool_column(batch, LasDimension::Overlap)?,
+            scan_channel: optional_u8_column(batch, LasDimension::ScanChannel)?,
+            scan_direction_flag: optional_bool_column(batch, LasDimension::ScanDirectionFlag)?,
+            edge_of_flight_line: optional_bool_column(batch, LasDimension::EdgeOfFlightLine)?,
+            classification: optional_u8_column(batch, LasDimension::Classification)?,
+            user_data: optional_u8_column(batch, LasDimension::UserData)?,
+            scan_angle_rank: optional_i16_column(batch, LasDimension::ScanAngleRank)?,
+            point_source_id: optional_u16_column(batch, LasDimension::PointSourceId)?,
+            gps_time: optional_f64_column(batch, LasDimension::GpsTime)?,
+            red,
+            green,
+            blue,
+        })
+    }
+
+    pub fn batch(&self) -> &LasColumnBatch {
+        self.batch
+    }
+
+    pub fn has_color(&self) -> bool {
+        self.red.is_some() && self.green.is_some() && self.blue.is_some()
+    }
+
+    pub fn bounds(&self) -> Result<Bounds> {
+        if self.is_empty() {
+            return Err(Error::InvalidInput(
+                "cannot compute bounds for empty column batch".into(),
+            ));
+        }
+        let mut bounds = Bounds::point(self.x[0], self.y[0], self.z[0]);
+        for index in 1..self.len() {
+            bounds.extend(self.x[index], self.y[index], self.z[index]);
+        }
+        Ok(bounds)
+    }
+}
+
+impl CopcPointSource for ColumnBatchSource<'_> {
+    fn len(&self) -> usize {
+        self.batch.len()
+    }
+
+    #[inline]
+    fn xyz(&self, index: usize) -> (f64, f64, f64) {
+        (self.x[index], self.y[index], self.z[index])
+    }
+
+    fn fields(&self, index: usize) -> Result<CopcPointFields> {
+        Ok(CopcPointFields {
+            x: self.x[index],
+            y: self.y[index],
+            z: self.z[index],
+            intensity: at_u16(self.intensity, index),
+            return_number: at_u8(self.return_number, index),
+            number_of_returns: at_u8(self.number_of_returns, index),
+            synthetic: at_bool_u8(self.synthetic, index),
+            key_point: at_bool_u8(self.key_point, index),
+            withheld: at_bool_u8(self.withheld, index),
+            overlap: at_bool_u8(self.overlap, index),
+            scan_channel: at_u8(self.scan_channel, index),
+            scan_direction_flag: at_bool_u8(self.scan_direction_flag, index),
+            edge_of_flight_line: at_bool_u8(self.edge_of_flight_line, index),
+            classification: at_u8(self.classification, index),
+            user_data: at_u8(self.user_data, index),
+            scan_angle: self
+                .scan_angle_rank
+                .map(|column| column[index] as f32 * 90.0 / 180.0)
+                .unwrap_or(0.0),
+            point_source_id: at_u16(self.point_source_id, index),
+            gps_time: self.gps_time.map(|column| column[index]).unwrap_or(0.0),
+            red: at_u16(self.red, index),
+            green: at_u16(self.green, index),
+            blue: at_u16(self.blue, index),
+        })
+    }
+}
+
+fn at_bool_u8(column: Option<&[bool]>, index: usize) -> u8 {
+    column.map(|values| u8::from(values[index])).unwrap_or(0)
+}
+
+fn at_u8(column: Option<&[u8]>, index: usize) -> u8 {
+    column.map(|values| values[index]).unwrap_or(0)
+}
+
+fn at_u16(column: Option<&[u16]>, index: usize) -> u16 {
+    column.map(|values| values[index]).unwrap_or(0)
+}
+
+fn validate_column_batch_writer_support(batch: &LasColumnBatch) -> Result<()> {
+    let unsupported: Vec<_> = batch
+        .columns
+        .iter()
+        .filter_map(|(spec, _)| match spec.dimension {
+            LasDimension::Nir => Some("NIR point data"),
+            LasDimension::WaveformPacketDescriptorIndex
+            | LasDimension::WaveformPacketByteOffset
+            | LasDimension::WaveformPacketSize
+            | LasDimension::WavePacketReturnPointWaveformLocation => Some("waveform point data"),
+            LasDimension::ExtraBytes => Some("extra point bytes"),
+            _ => None,
+        })
+        .collect();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(format!(
+            "COPC writer cannot preserve {}",
+            unsupported.join(", ")
+        )))
+    }
+}
+
+fn validate_color_columns(
+    red: Option<&[u16]>,
+    green: Option<&[u16]>,
+    blue: Option<&[u16]>,
+) -> Result<()> {
+    let present =
+        usize::from(red.is_some()) + usize::from(green.is_some()) + usize::from(blue.is_some());
+    if present == 0 || present == 3 {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(
+            "Red, Green, and Blue columns must be supplied together".into(),
+        ))
+    }
+}
+
+fn required_f64_column(batch: &LasColumnBatch, dimension: LasDimension) -> Result<&[f64]> {
+    match batch.column(dimension) {
+        Some(ColumnData::F64(values)) => Ok(values),
+        Some(other) => Err(unexpected_column_type(dimension, "F64", other)),
+        None => Err(Error::InvalidInput(format!(
+            "ColumnBatchSource requires {dimension:?} column"
+        ))),
+    }
+}
+
+fn optional_f64_column(batch: &LasColumnBatch, dimension: LasDimension) -> Result<Option<&[f64]>> {
+    match batch.column(dimension) {
+        Some(ColumnData::F64(values)) => Ok(Some(values)),
+        Some(other) => Err(unexpected_column_type(dimension, "F64", other)),
+        None => Ok(None),
+    }
+}
+
+fn optional_i16_column(batch: &LasColumnBatch, dimension: LasDimension) -> Result<Option<&[i16]>> {
+    match batch.column(dimension) {
+        Some(ColumnData::I16(values)) => Ok(Some(values)),
+        Some(other) => Err(unexpected_column_type(dimension, "I16", other)),
+        None => Ok(None),
+    }
+}
+
+fn optional_u16_column(batch: &LasColumnBatch, dimension: LasDimension) -> Result<Option<&[u16]>> {
+    match batch.column(dimension) {
+        Some(ColumnData::U16(values)) => Ok(Some(values)),
+        Some(other) => Err(unexpected_column_type(dimension, "U16", other)),
+        None => Ok(None),
+    }
+}
+
+fn optional_u8_column(batch: &LasColumnBatch, dimension: LasDimension) -> Result<Option<&[u8]>> {
+    match batch.column(dimension) {
+        Some(ColumnData::U8(values)) => Ok(Some(values)),
+        Some(other) => Err(unexpected_column_type(dimension, "U8", other)),
+        None => Ok(None),
+    }
+}
+
+fn optional_bool_column(
+    batch: &LasColumnBatch,
+    dimension: LasDimension,
+) -> Result<Option<&[bool]>> {
+    match batch.column(dimension) {
+        Some(ColumnData::Bool(values)) => Ok(Some(values)),
+        Some(other) => Err(unexpected_column_type(dimension, "Bool", other)),
+        None => Ok(None),
+    }
+}
+
+fn unexpected_column_type(dimension: LasDimension, expected: &str, actual: &ColumnData) -> Error {
+    Error::InvalidInput(format!(
+        "{dimension:?} column must be {expected}, found {:?}",
+        actual.scalar()
+    ))
 }
 
 struct SpillSource<'a> {
