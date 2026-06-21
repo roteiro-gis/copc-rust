@@ -170,24 +170,46 @@ pub enum ScalarType {
 pub struct ColumnSpec {
     pub dimension: LasDimension,
     pub scalar: ScalarType,
+    /// For `LasDimension::ExtraBytes`, the fixed byte count stored for each point.
+    pub byte_width: Option<usize>,
 }
 
 impl ColumnSpec {
     pub const fn new(dimension: LasDimension, scalar: ScalarType) -> Self {
-        Self { dimension, scalar }
+        Self {
+            dimension,
+            scalar,
+            byte_width: None,
+        }
+    }
+
+    pub const fn extra_bytes(byte_width: usize) -> Self {
+        Self {
+            dimension: LasDimension::ExtraBytes,
+            scalar: ScalarType::U8,
+            byte_width: Some(byte_width),
+        }
     }
 
     /// Returns the default fixed LAS/COPC scalar for `dimension`, when it has one.
     pub const fn default_for(dimension: LasDimension) -> Option<Self> {
         match dimension.default_scalar() {
-            Some(scalar) => Some(Self { dimension, scalar }),
+            Some(scalar) => Some(Self {
+                dimension,
+                scalar,
+                byte_width: None,
+            }),
             None => None,
         }
     }
 
     /// Returns whether this specification has the canonical scalar for its dimension.
     pub const fn has_default_scalar(self) -> bool {
-        self.dimension.accepts_scalar(self.scalar)
+        if matches!(self.dimension, LasDimension::ExtraBytes) {
+            matches!(self.scalar, ScalarType::U8) && self.byte_width.is_some()
+        } else {
+            self.byte_width.is_none() && self.dimension.accepts_scalar(self.scalar)
+        }
     }
 
     /// Returns whether `data` has the scalar type declared by this spec.
@@ -197,16 +219,26 @@ impl ColumnSpec {
 
     /// Validate the declared scalar against the supplied data.
     pub fn validate_data(self, data: &ColumnData) -> Result<()> {
-        if self.matches_data(data) {
-            Ok(())
-        } else {
-            Err(Error::InvalidInput(format!(
+        if !self.matches_data(data) {
+            return Err(Error::InvalidInput(format!(
                 "column {:?} declares {:?} data but contains {:?}",
                 self.dimension,
                 self.scalar,
                 data.scalar()
-            )))
+            )));
         }
+        if self.dimension == LasDimension::ExtraBytes && self.extra_byte_width().is_none() {
+            return Err(Error::InvalidInput(
+                "ExtraBytes column requires a non-zero byte width".into(),
+            ));
+        }
+        if self.dimension != LasDimension::ExtraBytes && self.byte_width.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "column {:?} cannot declare byte width {:?}",
+                self.dimension, self.byte_width
+            )));
+        }
+        Ok(())
     }
 
     /// Validate that this spec uses the fixed LAS/COPC scalar for its dimension.
@@ -220,6 +252,31 @@ impl ColumnSpec {
                 self.scalar,
                 self.dimension.default_scalar()
             )))
+        }
+    }
+
+    pub fn extra_byte_width(self) -> Option<usize> {
+        match (self.dimension, self.scalar, self.byte_width) {
+            (LasDimension::ExtraBytes, ScalarType::U8, Some(width)) if width > 0 => Some(width),
+            _ => None,
+        }
+    }
+
+    pub fn point_count_for_data(self, data: &ColumnData) -> Result<usize> {
+        self.validate_data(data)?;
+        if self.dimension == LasDimension::ExtraBytes {
+            let width = self.extra_byte_width().ok_or_else(|| {
+                Error::InvalidInput("ExtraBytes column requires a non-zero byte width".into())
+            })?;
+            if data.len() % width != 0 {
+                return Err(Error::InvalidInput(format!(
+                    "ExtraBytes column has {} bytes, which is not divisible by byte width {width}",
+                    data.len()
+                )));
+            }
+            Ok(data.len() / width)
+        } else {
+            Ok(data.len())
         }
     }
 }
@@ -411,9 +468,8 @@ pub fn layout_for_las_format(format: LasPointFormat) -> Vec<ColumnSpec> {
         );
     }
     if format.extra_bytes > 0 {
-        columns.push(ColumnSpec::new(LasDimension::ExtraBytes, ScalarType::U8));
+        columns.push(ColumnSpec::extra_bytes(usize::from(format.extra_bytes)));
     }
-
     columns
 }
 
@@ -443,7 +499,10 @@ pub struct LasColumnBatch {
 
 impl LasColumnBatch {
     pub fn new(columns: Vec<(ColumnSpec, ColumnData)>) -> Result<Self> {
-        let len = columns.first().map(|(_, data)| data.len()).unwrap_or(0);
+        let len = match columns.first() {
+            Some((spec, data)) => spec.point_count_for_data(data)?,
+            None => 0,
+        };
         let batch = Self { len, columns };
         batch.validate()?;
         Ok(batch)
@@ -480,13 +539,11 @@ impl LasColumnBatch {
     /// Validate scalar declarations and column lengths for this batch.
     pub fn validate(&self) -> Result<()> {
         for (spec, data) in &self.columns {
-            spec.validate_data(data)?;
-            if data.len() != self.len {
+            let point_count = spec.point_count_for_data(data)?;
+            if point_count != self.len {
                 return Err(Error::InvalidInput(format!(
-                    "column {:?} has {} values but batch len is {}",
-                    spec.dimension,
-                    data.len(),
-                    self.len
+                    "column {:?} has {} points but batch len is {}",
+                    spec.dimension, point_count, self.len
                 )));
             }
         }
@@ -606,12 +663,42 @@ mod tests {
     }
 
     #[test]
+    fn batch_validates_fixed_width_extra_bytes() {
+        let batch = LasColumnBatch::new(vec![(
+            ColumnSpec::extra_bytes(3),
+            ColumnData::U8(vec![1, 2, 3, 4, 5, 6]),
+        )])
+        .unwrap();
+
+        assert_eq!(2, batch.len());
+        assert_eq!(
+            Some(&ColumnData::U8(vec![1, 2, 3, 4, 5, 6])),
+            batch.column(LasDimension::ExtraBytes)
+        );
+
+        let invalid = LasColumnBatch::new(vec![(
+            ColumnSpec::extra_bytes(3),
+            ColumnData::U8(vec![1, 2, 3, 4]),
+        )]);
+        assert!(invalid.is_err());
+
+        let missing_width = LasColumnBatch::new(vec![(
+            ColumnSpec::new(LasDimension::ExtraBytes, ScalarType::U8),
+            ColumnData::U8(vec![1, 2, 3]),
+        )]);
+        assert!(missing_width.is_err());
+    }
+
+    #[test]
     fn default_scalar_validation_allows_extra_bytes() {
         assert_eq!(
             ColumnSpec::new(LasDimension::GpsTime, ScalarType::F64),
             ColumnSpec::default_for(LasDimension::GpsTime).unwrap()
         );
-        assert!(ColumnSpec::new(LasDimension::ExtraBytes, ScalarType::I32).has_default_scalar());
+        assert!(ColumnSpec::extra_bytes(4).has_default_scalar());
+        assert!(ColumnSpec::new(LasDimension::ExtraBytes, ScalarType::U8)
+            .validate_default_scalar()
+            .is_err());
         assert!(
             ColumnSpec::new(LasDimension::ScanAngleRank, ScalarType::F32)
                 .validate_default_scalar()
@@ -727,15 +814,12 @@ mod tests {
     }
 
     #[test]
-    fn layout_includes_extra_bytes_when_format_declares_them() {
+    fn layout_includes_extra_bytes_with_byte_width_when_format_declares_them() {
         let mut format = LasPointFormat::new(0).unwrap();
         format.extra_bytes = 4;
 
         let layout = layout_for_las_format(format);
 
-        assert_eq!(
-            Some(&ColumnSpec::new(LasDimension::ExtraBytes, ScalarType::U8)),
-            layout.last()
-        );
+        assert_eq!(Some(&ColumnSpec::extra_bytes(4)), layout.last());
     }
 }
