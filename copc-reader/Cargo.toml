@@ -18,6 +18,6 @@ exclude = [
 
 [dependencies]
 byteorder = { workspace = true }
-copc-core = { version = "0.2.0", path = "../copc-core" }
+copc-core = { version = "0.3.0", path = "../copc-core" }
 las = { workspace = true }
 laz = { workspace = true }
