@@ -226,15 +226,11 @@ fn selected_column_builders(
     layout_for_las_format(point_format)
         .into_iter()
         .filter(|spec| selection.contains(spec.dimension))
-        .map(|spec| empty_column(spec, capacity, point_format.extra_bytes))
+        .map(|spec| empty_column(spec, capacity))
         .collect()
 }
 
-fn empty_column(
-    spec: ColumnSpec,
-    capacity: usize,
-    extra_bytes: u16,
-) -> Result<(ColumnSpec, ColumnData)> {
+fn empty_column(spec: ColumnSpec, capacity: usize) -> Result<(ColumnSpec, ColumnData)> {
     let data = match spec.scalar {
         copc_core::ScalarType::F64 => ColumnData::F64(Vec::with_capacity(capacity)),
         copc_core::ScalarType::F32 => ColumnData::F32(Vec::with_capacity(capacity)),
@@ -246,11 +242,16 @@ fn empty_column(
         copc_core::ScalarType::U32 => ColumnData::U32(Vec::with_capacity(capacity)),
         copc_core::ScalarType::U16 => ColumnData::U16(Vec::with_capacity(capacity)),
         copc_core::ScalarType::U8 => {
-            if spec.dimension == LasDimension::ExtraBytes && extra_bytes > 1 {
-                return Err(Error::Unsupported(format!(
-                    "materialized ExtraBytes columns require one byte per point, got {extra_bytes}"
-                )));
-            }
+            let capacity = if spec.dimension == LasDimension::ExtraBytes {
+                let width = spec.extra_byte_width().ok_or_else(|| {
+                    Error::InvalidInput("ExtraBytes column requires a non-zero byte width".into())
+                })?;
+                capacity.checked_mul(width).ok_or_else(|| {
+                    Error::InvalidInput("ExtraBytes column capacity exceeds usize range".into())
+                })?
+            } else {
+                capacity
+            };
             ColumnData::U8(Vec::with_capacity(capacity))
         }
         copc_core::ScalarType::Bool => ColumnData::Bool(Vec::with_capacity(capacity)),
@@ -287,7 +288,7 @@ fn append_columns(
     };
 
     for (spec, data) in columns {
-        append_column(spec.dimension, data, &context)?;
+        append_column(*spec, data, &context)?;
     }
     Ok(())
 }
@@ -303,10 +304,11 @@ struct ColumnAppendContext<'a> {
 }
 
 fn append_column(
-    dimension: LasDimension,
+    spec: ColumnSpec,
     data: &mut ColumnData,
     context: &ColumnAppendContext<'_>,
 ) -> Result<()> {
+    let dimension = spec.dimension;
     let scalar = data.scalar();
     match (dimension, data) {
         (LasDimension::X, ColumnData::F64(values)) => values.push(context.xyz.0),
@@ -404,7 +406,16 @@ fn append_column(
             );
         }
         (LasDimension::ExtraBytes, ColumnData::U8(values)) => {
-            values.push(context.raw_point.extra_bytes.first().copied().unwrap_or(0));
+            let width = spec.extra_byte_width().ok_or_else(|| {
+                Error::InvalidData("ExtraBytes column requires a non-zero byte width".into())
+            })?;
+            if context.raw_point.extra_bytes.len() != width {
+                return Err(Error::InvalidData(format!(
+                    "ExtraBytes point has {} bytes, expected {width}",
+                    context.raw_point.extra_bytes.len()
+                )));
+            }
+            values.extend_from_slice(&context.raw_point.extra_bytes);
         }
         _ => {
             return Err(Error::InvalidData(format!(
@@ -730,4 +741,76 @@ fn voxel_bounds(key: copc_core::VoxelKey, info: &CopcInfo) -> Result<Bounds> {
         root_min.2 + f64::from(key.z) * side,
     );
     Ok(Bounds::new(min, (min.0 + side, min.1 + side, min.2 + side)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_column_builders_include_extra_bytes_width() {
+        let mut format = LasPointFormat::new(6).unwrap();
+        format.extra_bytes = 3;
+
+        let columns = selected_column_builders(format, ColumnSelection::all(), 2).unwrap();
+
+        let extra_spec = columns
+            .iter()
+            .map(|(spec, _)| *spec)
+            .find(|spec| spec.dimension == LasDimension::ExtraBytes)
+            .expect("ExtraBytes column spec");
+        assert_eq!(Some(3), extra_spec.extra_byte_width());
+        assert_eq!(copc_core::ScalarType::U8, extra_spec.scalar);
+    }
+
+    #[test]
+    fn append_columns_preserves_fixed_width_extra_bytes() {
+        let mut format = LasPointFormat::new(6).unwrap();
+        format.extra_bytes = 3;
+        let mut columns = selected_column_builders(
+            format,
+            ColumnSelection::from_dimensions([LasDimension::X, LasDimension::ExtraBytes]),
+            1,
+        )
+        .unwrap();
+        let raw_point = las::raw::Point {
+            x: 10,
+            y: 20,
+            z: 30,
+            flags: las::raw::point::Flags::ThreeByte(1 | (1 << 4), 0, 2),
+            scan_angle: las::raw::point::ScanAngle::from(0.0),
+            extra_bytes: vec![9, 8, 7],
+            ..Default::default()
+        };
+
+        append_columns(&mut columns, &raw_point, (1.0, 2.0, 3.0)).unwrap();
+        let batch = LasColumnBatch::new(columns).unwrap();
+
+        assert_eq!(1, batch.len());
+        assert_eq!(
+            Some(&ColumnData::U8(vec![9, 8, 7])),
+            batch.column(LasDimension::ExtraBytes)
+        );
+    }
+
+    #[test]
+    fn append_columns_rejects_wrong_extra_bytes_width() {
+        let mut format = LasPointFormat::new(6).unwrap();
+        format.extra_bytes = 3;
+        let mut columns = selected_column_builders(
+            format,
+            ColumnSelection::from_dimensions([LasDimension::ExtraBytes]),
+            1,
+        )
+        .unwrap();
+        let raw_point = las::raw::Point {
+            flags: las::raw::point::Flags::ThreeByte(1 | (1 << 4), 0, 2),
+            extra_bytes: vec![9, 8],
+            ..Default::default()
+        };
+
+        let err = append_columns(&mut columns, &raw_point, (1.0, 2.0, 3.0)).unwrap_err();
+
+        assert!(err.to_string().contains("expected 3"));
+    }
 }
