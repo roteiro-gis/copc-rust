@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-06-22
+
 - add LAS/COPC-native column types in `copc-core`, materialized column reads in
   `copc-reader`, and a `copc-writer` `ColumnBatchSource` adapter for writing
   neutral `LasColumnBatch` values directly
