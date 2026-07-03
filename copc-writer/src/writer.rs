@@ -37,10 +37,12 @@ const WKT_CRS_RECORD_ID: u16 = 2112;
 const GEOTIFF_GEO_KEY_DIRECTORY_RECORD_ID: u16 = 34735;
 const GEOTIFF_DOUBLE_PARAMS_RECORD_ID: u16 = 34736;
 const GEOTIFF_ASCII_PARAMS_RECORD_ID: u16 = 34737;
+const LASF_SPEC_USER_ID: &str = "LASF_Spec";
+const EXTRA_BYTES_RECORD_ID: u16 = 4;
 const WKT_GLOBAL_ENCODING_BIT: u16 = 16;
 
 /// Normalized point fields consumed by the COPC writer.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CopcPointFields {
     pub x: f64,
     pub y: f64,
@@ -64,6 +66,7 @@ pub struct CopcPointFields {
     pub red: u16,
     pub green: u16,
     pub blue: u16,
+    pub extra_bytes: Vec<u8>,
 }
 
 /// Abstract point-data source for COPC emission.
@@ -71,6 +74,12 @@ pub trait CopcPointSource {
     fn len(&self) -> usize;
     fn xyz(&self, index: usize) -> (f64, f64, f64);
     fn fields(&self, index: usize) -> Result<CopcPointFields>;
+    fn extra_byte_count(&self) -> u16 {
+        0
+    }
+    fn extra_bytes_vlrs(&self) -> &[las::Vlr] {
+        &[]
+    }
 
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -101,6 +110,7 @@ pub struct ColumnBatchSource<'a> {
     red: Option<&'a [u16]>,
     green: Option<&'a [u16]>,
     blue: Option<&'a [u16]>,
+    extra_bytes: Option<(&'a [u8], usize)>,
 }
 
 impl<'a> ColumnBatchSource<'a> {
@@ -114,6 +124,7 @@ impl<'a> ColumnBatchSource<'a> {
         let red = optional_u16_column(batch, LasDimension::Red)?;
         let green = optional_u16_column(batch, LasDimension::Green)?;
         let blue = optional_u16_column(batch, LasDimension::Blue)?;
+        let extra_bytes = optional_extra_bytes_column(batch)?;
         validate_color_columns(red, green, blue)?;
 
         Ok(Self {
@@ -139,6 +150,7 @@ impl<'a> ColumnBatchSource<'a> {
             red,
             green,
             blue,
+            extra_bytes,
         })
     }
 
@@ -148,6 +160,10 @@ impl<'a> ColumnBatchSource<'a> {
 
     pub fn has_color(&self) -> bool {
         self.red.is_some() && self.green.is_some() && self.blue.is_some()
+    }
+
+    pub fn extra_byte_width(&self) -> usize {
+        self.extra_bytes.map(|(_, width)| width).unwrap_or(0)
     }
 
     pub fn bounds(&self) -> Result<Bounds> {
@@ -200,7 +216,12 @@ impl CopcPointSource for ColumnBatchSource<'_> {
             red: at_u16(self.red, index),
             green: at_u16(self.green, index),
             blue: at_u16(self.blue, index),
+            extra_bytes: extra_bytes_at(self.extra_bytes, index),
         })
+    }
+
+    fn extra_byte_count(&self) -> u16 {
+        self.extra_byte_width() as u16
     }
 }
 
@@ -226,7 +247,6 @@ fn validate_column_batch_writer_support(batch: &LasColumnBatch) -> Result<()> {
             | LasDimension::WaveformPacketByteOffset
             | LasDimension::WaveformPacketSize
             | LasDimension::WavePacketReturnPointWaveformLocation => Some("waveform point data"),
-            LasDimension::ExtraBytes => Some("extra point bytes"),
             _ => None,
         })
         .collect();
@@ -298,6 +318,49 @@ fn optional_u8_column(batch: &LasColumnBatch, dimension: LasDimension) -> Result
     }
 }
 
+fn optional_extra_bytes_column(batch: &LasColumnBatch) -> Result<Option<(&[u8], usize)>> {
+    let mut extra_bytes = None;
+    for (spec, data) in &batch.columns {
+        if spec.dimension != LasDimension::ExtraBytes {
+            continue;
+        }
+        let width = spec.extra_byte_width().ok_or_else(|| {
+            Error::InvalidInput("ExtraBytes column requires a non-zero byte width".into())
+        })?;
+        if width > usize::from(u16::MAX) {
+            return Err(Error::InvalidInput(format!(
+                "ExtraBytes column width {width} exceeds LAS u16 range"
+            )));
+        }
+        let values = match data {
+            ColumnData::U8(values) => values.as_slice(),
+            other => {
+                return Err(unexpected_column_type(
+                    LasDimension::ExtraBytes,
+                    "U8",
+                    other,
+                ))
+            }
+        };
+        if extra_bytes.replace((values, width)).is_some() {
+            return Err(Error::InvalidInput(
+                "ColumnBatchSource supports at most one ExtraBytes column".into(),
+            ));
+        }
+    }
+    Ok(extra_bytes)
+}
+
+fn extra_bytes_at(column: Option<(&[u8], usize)>, index: usize) -> Vec<u8> {
+    match column {
+        Some((values, width)) => {
+            let start = index * width;
+            values[start..start + width].to_vec()
+        }
+        None => Vec::new(),
+    }
+}
+
 fn optional_bool_column(
     batch: &LasColumnBatch,
     dimension: LasDimension,
@@ -354,7 +417,16 @@ impl CopcPointSource for SpillSource<'_> {
             red: record.red,
             green: record.green,
             blue: record.blue,
+            extra_bytes: record.extra_bytes,
         })
+    }
+
+    fn extra_byte_count(&self) -> u16 {
+        self.reader.layout().extra_bytes
+    }
+
+    fn extra_bytes_vlrs(&self) -> &[las::Vlr] {
+        &self.reader.layout().extra_bytes_descriptors
     }
 }
 
@@ -591,7 +663,7 @@ pub fn convert_las_to_copc_streaming(
     let mut reader = las::Reader::from_path(las_path).map_err(|e| Error::Las(e.to_string()))?;
     validate_las_conversion_supported(reader.header())?;
     let output_metadata = OutputLasMetadata::from_las_header(reader.header());
-    let layout = StreamingLayout::from_las_format(*reader.header().point_format());
+    let layout = StreamingLayout::from_las_header(reader.header());
     let mut spill = SpillWriter::create(spill_dir, layout)?;
     for (index, result) in reader.points().enumerate() {
         if index % CANCEL_POLL_STRIDE == 0 {
@@ -634,14 +706,11 @@ fn validate_las_conversion_supported(header: &las::Header) -> Result<()> {
     if format.has_waveform {
         unsupported.push("waveform point data".to_string());
     }
-    if format.extra_bytes > 0 {
-        unsupported.push(format!("{} extra point byte(s)", format.extra_bytes));
-    }
     let source_has_wkt_crs_record = has_wkt_crs_record(header);
     let mut geotiff_crs_record_count = 0usize;
     let mut unsupported_vlr_count = 0usize;
     for vlr in header.vlrs() {
-        if is_laszip_vlr(vlr) || is_wkt_crs_vlr(vlr) {
+        if is_laszip_vlr(vlr) || is_wkt_crs_vlr(vlr) || is_extra_bytes_descriptor_vlr(vlr) {
             continue;
         }
         if is_geotiff_crs_vlr(vlr) {
@@ -720,6 +789,10 @@ fn is_geotiff_crs_vlr(vlr: &las::Vlr) -> bool {
         )
 }
 
+fn is_extra_bytes_descriptor_vlr(vlr: &las::Vlr) -> bool {
+    vlr.user_id == LASF_SPEC_USER_ID && vlr.record_id == EXTRA_BYTES_RECORD_ID
+}
+
 fn has_wkt_crs_record(header: &las::Header) -> bool {
     header.vlrs().iter().any(is_wkt_crs_vlr) || header.evlrs().iter().any(is_wkt_crs_vlr)
 }
@@ -758,6 +831,7 @@ fn validate_coordinate_inputs<S: CopcPointSource>(
 ) -> Result<PointStats> {
     validate_bounds(bounds)?;
     validate_transform(scale, offset)?;
+    let extra_byte_count = usize::from(source.extra_byte_count());
     let mut stats = PointStats::new();
     for index in 0..source.len() {
         if index % CANCEL_POLL_STRIDE == 0 {
@@ -772,6 +846,12 @@ fn validate_coordinate_inputs<S: CopcPointSource>(
         quantize_xyz(index, fields.x, fields.y, fields.z, scale, offset)?;
         validate_scan_angle(index, fields.scan_angle)?;
         validate_point_flags(index, &fields)?;
+        if fields.extra_bytes.len() != extra_byte_count {
+            return Err(Error::InvalidInput(format!(
+                "point {index} has {} extra byte(s), expected {extra_byte_count}",
+                fields.extra_bytes.len()
+            )));
+        }
         stats.record(index, &fields)?;
     }
     Ok(stats)
@@ -949,8 +1029,10 @@ fn write_copc_inner<S: CopcPointSource>(
 ) -> Result<()> {
     cancel.check()?;
     let point_format_id = if has_color { 7u8 } else { 6u8 };
-    let point_format =
+    let mut point_format =
         LasFormat::new(point_format_id).map_err(|e| Error::Las(format!("point format: {e}")))?;
+    let extra_byte_count = source.extra_byte_count();
+    point_format.extra_bytes = extra_byte_count;
     let point_record_length = point_format.len();
 
     let (scale_x, scale_y, scale_z) = metadata.scale;
@@ -971,7 +1053,7 @@ fn write_copc_inner<S: CopcPointSource>(
     cancel.check()?;
 
     let var_vlr = LazVlrBuilder::default()
-        .with_point_format(point_format_id, 0)
+        .with_point_format(point_format_id, extra_byte_count)
         .map_err(|e| Error::Las(format!("laz items: {e}")))?
         .with_variable_chunk_size()
         .build();
@@ -984,9 +1066,12 @@ fn write_copc_inner<S: CopcPointSource>(
     let las_header_size = 375u32;
     let regular_crs_vlr_count = metadata.regular_crs_vlr_count();
     let regular_crs_vlr_bytes = metadata.regular_crs_vlr_bytes()?;
+    let extra_bytes_vlrs = source.extra_bytes_vlrs();
+    let extra_bytes_vlr_bytes = regular_las_vlrs_bytes(extra_bytes_vlrs)?;
     let number_of_vlrs = u32::try_from(
         2usize
             .checked_add(regular_crs_vlr_count)
+            .and_then(|count| count.checked_add(extra_bytes_vlrs.len()))
             .ok_or_else(|| Error::InvalidInput("VLR count overflow".into()))?,
     )
     .map_err(|_| Error::InvalidInput("VLR count overflow".into()))?;
@@ -1003,6 +1088,7 @@ fn write_copc_inner<S: CopcPointSource>(
         .ok_or_else(|| Error::InvalidInput("LAZ VLR byte size overflow".into()))?;
     let total_vlr_bytes = (LAS_VLR_HEADER_BYTES + u32::from(copc_info_vlr_size))
         .checked_add(regular_crs_vlr_bytes)
+        .and_then(|total| total.checked_add(extra_bytes_vlr_bytes))
         .and_then(|total| total.checked_add(var_vlr_storage_bytes))
         .ok_or_else(|| Error::InvalidInput("VLR byte size overflow".into()))?;
     let offset_to_point_data = las_header_size
@@ -1044,6 +1130,9 @@ fn write_copc_inner<S: CopcPointSource>(
         .map_err(|e| Error::io("write COPC info placeholder", e))?;
 
     for vlr in metadata.regular_crs_vlrs() {
+        write_las_vlr(&mut writer, vlr)?;
+    }
+    for vlr in extra_bytes_vlrs {
         write_las_vlr(&mut writer, vlr)?;
     }
 
@@ -1846,6 +1935,22 @@ fn write_las_vlr<W: Write>(writer: &mut W, vlr: &las::Vlr) -> Result<()> {
     Ok(())
 }
 
+fn regular_las_vlrs_bytes(vlrs: &[las::Vlr]) -> Result<u32> {
+    vlrs.iter().try_fold(0u32, |total, vlr| {
+        let data_len = u16::try_from(vlr.data.len()).map_err(|_| {
+            Error::InvalidInput(format!(
+                "regular VLR {}:{} is too large: {} byte(s)",
+                vlr.user_id,
+                vlr.record_id,
+                vlr.data.len()
+            ))
+        })?;
+        total
+            .checked_add(LAS_VLR_HEADER_BYTES + u32::from(data_len))
+            .ok_or_else(|| Error::InvalidInput("VLR byte size overflow".into()))
+    })
+}
+
 fn write_evlr_header<W: Write>(
     writer: &mut W,
     user_id: &str,
@@ -1927,7 +2032,7 @@ fn encode_point_record(
             .then_some(Color::new(fields.red, fields.green, fields.blue)),
         waveform: None,
         nir: None,
-        extra_bytes: Vec::new(),
+        extra_bytes: fields.extra_bytes.clone(),
     };
     point
         .write_to(&mut cursor, format)
@@ -1949,12 +2054,12 @@ mod tests {
         }
 
         fn xyz(&self, index: usize) -> (f64, f64, f64) {
-            let point = self.points[index];
+            let point = &self.points[index];
             (point.x, point.y, point.z)
         }
 
         fn fields(&self, index: usize) -> Result<CopcPointFields> {
-            Ok(self.points[index])
+            Ok(self.points[index].clone())
         }
     }
 
@@ -1983,6 +2088,7 @@ mod tests {
                 red: 0,
                 green: 0,
                 blue: 0,
+                extra_bytes: Vec::new(),
             })
             .collect();
         let source = VecSource { points };
@@ -2042,6 +2148,7 @@ mod tests {
             red: 0,
             green: 0,
             blue: 0,
+            extra_bytes: Vec::new(),
         };
         // 4000 distinct points packed into a ~0.4-unit cluster ...
         let mut points: Vec<CopcPointFields> = (0..4_000u32)

@@ -22,12 +22,12 @@ impl CopcPointSource for VecSource {
     }
 
     fn xyz(&self, index: usize) -> (f64, f64, f64) {
-        let p = self.points[index];
+        let p = &self.points[index];
         (p.x, p.y, p.z)
     }
 
     fn fields(&self, index: usize) -> copc_core::Result<CopcPointFields> {
-        Ok(self.points[index])
+        Ok(self.points[index].clone())
     }
 }
 
@@ -58,6 +58,7 @@ fn writer_output_parses_with_reader_hierarchy() {
             red: 0,
             green: 0,
             blue: 0,
+            extra_bytes: Vec::new(),
         });
     }
     let bounds = points.iter().fold(
@@ -155,6 +156,7 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
             red: 1000,
             green: 2000,
             blue: 3000,
+            extra_bytes: Vec::new(),
         },
         CopcPointFields {
             x: 11.0,
@@ -178,6 +180,7 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
             red: 4000,
             green: 5000,
             blue: 6000,
+            extra_bytes: Vec::new(),
         },
     ];
     let bounds = source_bounds(&points);
@@ -492,6 +495,70 @@ fn streaming_conversion_preserves_supported_header_metadata() {
 }
 
 #[test]
+fn streaming_conversion_preserves_extra_point_bytes_and_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("extra-bytes.las");
+    let copc_path = dir.path().join("extra-bytes.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let descriptor = extra_bytes_descriptor_vlr_data();
+    let mut format = las::point::Format::new(6).unwrap();
+    format.extra_bytes = 3;
+    let mut builder = las::Builder::from((1, 4));
+    builder.point_format = format;
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Spec".to_string(),
+        record_id: 4,
+        description: "Extra bytes".to_string(),
+        data: descriptor.clone(),
+    });
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    let expected_extra = vec![0x11, 0x22, 0xFE];
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            extra_bytes: expected_extra.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap();
+
+    let header = read_las_header_prefix(&copc_path);
+    assert_eq!(3, header.number_of_vlrs);
+
+    let mut reader = las::Reader::from_path(&copc_path).unwrap();
+    assert_eq!(6, reader.header().point_format().to_u8().unwrap());
+    assert_eq!(3, reader.header().point_format().extra_bytes);
+    let descriptors: Vec<_> = reader
+        .header()
+        .vlrs()
+        .iter()
+        .filter(|vlr| vlr.user_id == "LASF_Spec" && vlr.record_id == 4)
+        .collect();
+    assert_eq!(1, descriptors.len());
+    assert_eq!(descriptor.as_slice(), descriptors[0].data.as_slice());
+
+    let points = reader.points().collect::<las::Result<Vec<_>>>().unwrap();
+    assert_eq!(1, points.len());
+    assert_eq!(expected_extra, points[0].extra_bytes);
+}
+
+#[test]
 fn streaming_conversion_rejects_unsupported_point_dimensions() {
     let dir = tempfile::tempdir().unwrap();
     let las_path = dir.path().join("unsupported-dimensions.las");
@@ -499,10 +566,8 @@ fn streaming_conversion_rejects_unsupported_point_dimensions() {
     let spill_dir = dir.path().join("spill");
     std::fs::create_dir(&spill_dir).unwrap();
 
-    let mut format = las::point::Format::new(8).unwrap();
-    format.extra_bytes = 2;
     let mut builder = las::Builder::from((1, 4));
-    builder.point_format = format;
+    builder.point_format = las::point::Format::new(8).unwrap();
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
         .write(las::Point {
@@ -514,7 +579,6 @@ fn streaming_conversion_rejects_unsupported_point_dimensions() {
             gps_time: Some(1.0),
             color: Some(Color::new(1, 2, 3)),
             nir: Some(4),
-            extra_bytes: vec![5, 6],
             ..Default::default()
         })
         .unwrap();
@@ -530,7 +594,6 @@ fn streaming_conversion_rejects_unsupported_point_dimensions() {
     .unwrap_err();
     let message = err.to_string();
     assert!(message.contains("NIR point data"));
-    assert!(message.contains("extra point byte"));
 }
 
 #[test]
@@ -821,6 +884,8 @@ fn streaming_writer_rejects_unsupported_layout_dimensions() {
         has_color: true,
         has_nir: true,
         has_waveform: true,
+        extra_bytes: 0,
+        extra_bytes_descriptors: Vec::new(),
     };
 
     let err = write_streaming_with_cancel(
@@ -850,6 +915,8 @@ fn streaming_writer_rejects_non_finite_record_coordinate() {
         has_color: false,
         has_nir: false,
         has_waveform: false,
+        extra_bytes: 0,
+        extra_bytes_descriptors: Vec::new(),
     };
 
     let err = write_streaming_with_cancel(
@@ -915,6 +982,15 @@ fn read_extended_return_counts(path: &std::path::Path) -> [u64; 15] {
 
 fn wgs84_wkt_vlr_data() -> Vec<u8> {
     b"GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433],AUTHORITY[\"EPSG\",\"4326\"]]\0".to_vec()
+}
+
+fn extra_bytes_descriptor_vlr_data() -> Vec<u8> {
+    let mut data = vec![0u8; 192];
+    let name = b"extra_u8x";
+    data[4..4 + name.len()].copy_from_slice(name);
+    let description = b"three raw extra bytes";
+    data[160..160 + description.len()].copy_from_slice(description);
+    data
 }
 
 fn source_bounds(points: &[CopcPointFields]) -> Bounds {
@@ -1002,6 +1078,7 @@ fn point_fields(x: f64, y: f64, z: f64) -> CopcPointFields {
         red: 0,
         green: 0,
         blue: 0,
+        extra_bytes: Vec::new(),
     }
 }
 
@@ -1033,5 +1110,6 @@ fn las_record(x: f64, y: f64, z: f64) -> copc_core::LasPointRecord {
         byte_offset_to_waveform_data: 0,
         waveform_packet_size: 0,
         return_point_waveform_location: 0.0,
+        extra_bytes: Vec::new(),
     }
 }
