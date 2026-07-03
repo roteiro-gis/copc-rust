@@ -16,6 +16,17 @@ use crate::spill::{SpillReader, SpillWriter};
 const CANCEL_POLL_STRIDE: usize = 4_096;
 const HIERARCHY_PAGE_MAX_ENTRIES: usize = 4_096;
 const INDEX_RECORD_BYTES: u64 = 4;
+/// Depth bounds for the LOD octree. The layered LAZ compressor buffers an
+/// entire COPC chunk (one octree node) in memory before flushing, so a node
+/// holding far more than `max_points_per_node` points costs proportional
+/// memory. A too-shallow `max_depth` over a dense cluster stops subdivision
+/// while a node is still huge — the multi-gigabyte failure mode on real clouds.
+/// Clamping `max_depth` up to `MIN_LEAF_DEPTH` keeps nodes subdividing until
+/// they fit in a chunk; realistic clouds reach that far shallower, so it only
+/// affects pathologically dense input. `MAX_LEAF_DEPTH` keeps voxel keys in
+/// range.
+const MIN_LEAF_DEPTH: u32 = 21;
+const MAX_LEAF_DEPTH: u32 = 30;
 const LAS_14_SCAN_ANGLE_SCALE: f32 = 0.006;
 const LASZIP_VLR_USER_ID: &str = "laszip encoded";
 const LASZIP_VLR_RECORD_ID: u16 = 22204;
@@ -1210,7 +1221,7 @@ fn build_lod_index<S: CopcPointSource>(
         Error::InvalidInput("COPC writer supports at most u32::MAX points per file".into())
     })?;
     let max_points_per_node = params.max_points_per_node.max(1) as usize;
-    let max_depth = params.max_depth.min(30);
+    let max_depth = params.max_depth.clamp(MIN_LEAF_DEPTH, MAX_LEAF_DEPTH);
     let root_run = write_root_index_run(total_points, cancel)?;
     let mut order_file = new_index_tempfile("order")?;
     let mut order_offset = 0;
@@ -1793,6 +1804,77 @@ mod tests {
         }
         assert_eq!(source.len(), total);
         assert!(seen.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn dense_cluster_stays_bounded_below_giant_chunks() {
+        // A dense cluster inside large bounds: at a shallow `max_depth` the whole
+        // cluster would collapse into one oversized leaf, forcing the layered LAZ
+        // compressor to buffer that entire chunk in memory (the multi-GB failure
+        // mode on real clouds). The writer must keep subdividing dense nodes past
+        // `max_depth` so no COPC chunk exceeds `max_points_per_node`.
+        let field = |x: f64, y: f64, z: f64, i: u32| CopcPointFields {
+            x,
+            y,
+            z,
+            intensity: 0,
+            return_number: 1,
+            number_of_returns: 1,
+            synthetic: 0,
+            key_point: 0,
+            withheld: 0,
+            overlap: 0,
+            scan_channel: 0,
+            scan_direction_flag: 0,
+            edge_of_flight_line: 0,
+            classification: 0,
+            user_data: 0,
+            scan_angle: 0.0,
+            point_source_id: 0,
+            gps_time: f64::from(i),
+            red: 0,
+            green: 0,
+            blue: 0,
+        };
+        // 4000 distinct points packed into a ~0.4-unit cluster ...
+        let mut points: Vec<CopcPointFields> = (0..4_000u32)
+            .map(|i| {
+                let f = f64::from(i);
+                field(
+                    f * 1e-4,
+                    (f * 1.7).fract() * 0.4,
+                    (f * 2.3).fract() * 0.4,
+                    i,
+                )
+            })
+            .collect();
+        // ... plus a few points spread wide to set large bounds around it.
+        for i in 0..8u32 {
+            points.push(field(
+                f64::from(i) * 1000.0,
+                f64::from(i) * 1000.0,
+                f64::from(i) * 100.0,
+                100_000 + i,
+            ));
+        }
+        let max_points = 100usize;
+        let source = VecSource { points };
+        let bounds = source_bounds(&source);
+        let (center, halfsize) = cube_from_bounds(&bounds);
+        // Deliberately shallow — the writer must override it for the dense cluster.
+        let params = CopcWriterParams {
+            max_points_per_node: max_points as u32,
+            max_depth: 3,
+        };
+
+        let lod = build_lod_index(&source, center, halfsize, &params, &NeverCancel).unwrap();
+        for (key, indices) in read_lod_index(&lod).unwrap() {
+            assert!(
+                indices.len() <= max_points,
+                "node {key:?} holds {} points, exceeding max_points_per_node {max_points}",
+                indices.len(),
+            );
+        }
     }
 
     #[test]
