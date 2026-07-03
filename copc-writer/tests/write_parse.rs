@@ -579,19 +579,132 @@ fn streaming_conversion_rejects_waveform_point_dimensions() {
 }
 
 #[test]
-fn streaming_conversion_rejects_source_vlrs() {
+fn streaming_conversion_preserves_wkt_crs_vlr() {
     let dir = tempfile::tempdir().unwrap();
-    let las_path = dir.path().join("vlr.las");
-    let copc_path = dir.path().join("vlr.copc.laz");
+    let las_path = dir.path().join("wkt-crs.laz");
+    let copc_path = dir.path().join("wkt-crs.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let wkt = wgs84_wkt_vlr_data();
+    let mut builder = las::Builder::from((1, 4));
+    builder.has_wkt_crs = true;
+    builder.point_format = las::point::Format::new(6).unwrap();
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Projection".to_string(),
+        record_id: 2112,
+        description: "OGC WKT CRS".to_string(),
+        data: wkt.clone(),
+    });
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap();
+
+    let header = read_las_header_prefix(&copc_path);
+    assert_eq!(3, header.number_of_vlrs);
+    assert_eq!(16, header.global_encoding & 16);
+
+    let reader = las::Reader::from_path(&copc_path).unwrap();
+    assert!(reader.header().has_wkt_crs());
+    let crs_records: Vec<_> = reader
+        .header()
+        .all_vlrs()
+        .filter(|vlr| vlr.user_id == "LASF_Projection" && vlr.record_id == 2112)
+        .collect();
+    assert_eq!(1, crs_records.len());
+    assert_eq!(wkt.as_slice(), crs_records[0].data.as_slice());
+}
+
+#[test]
+fn streaming_conversion_preserves_wkt_crs_evlr() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("wkt-crs-evlr.las");
+    let copc_path = dir.path().join("wkt-crs-evlr.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let wkt = wgs84_wkt_vlr_data();
+    let mut builder = las::Builder::from((1, 4));
+    builder.has_wkt_crs = true;
+    builder.point_format = las::point::Format::new(6).unwrap();
+    builder.evlrs.push(las::Vlr {
+        user_id: "LASF_Projection".to_string(),
+        record_id: 2112,
+        description: "OGC WKT CRS".to_string(),
+        data: wkt.clone(),
+    });
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap();
+
+    let header = read_las_header_prefix(&copc_path);
+    assert_eq!(2, header.number_of_vlrs);
+    assert_eq!(16, header.global_encoding & 16);
+
+    let reader = las::Reader::from_path(&copc_path).unwrap();
+    assert!(reader.header().has_wkt_crs());
+    let crs_records: Vec<_> = reader
+        .header()
+        .evlrs()
+        .iter()
+        .filter(|vlr| vlr.user_id == "LASF_Projection" && vlr.record_id == 2112)
+        .collect();
+    assert_eq!(1, crs_records.len());
+    assert_eq!(wkt.as_slice(), crs_records[0].data.as_slice());
+}
+
+#[test]
+fn streaming_conversion_rejects_non_crs_source_vlrs() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("custom-vlr.las");
+    let copc_path = dir.path().join("custom-vlr.copc.laz");
     let spill_dir = dir.path().join("spill");
     std::fs::create_dir(&spill_dir).unwrap();
 
     let mut builder = las::Builder::from((1, 4));
     builder.point_format = las::point::Format::new(6).unwrap();
     builder.vlrs.push(las::Vlr {
-        user_id: "LASF_Projection".to_string(),
-        record_id: 2112,
-        description: "CRS metadata".to_string(),
+        user_id: "example".to_string(),
+        record_id: 42,
+        description: "custom metadata".to_string(),
         data: vec![1, 2, 3],
     });
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
@@ -617,6 +730,49 @@ fn streaming_conversion_rejects_source_vlrs() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("VLR"));
+}
+
+#[test]
+fn streaming_conversion_rejects_geotiff_only_crs_with_specific_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("geotiff-crs.las");
+    let copc_path = dir.path().join("geotiff-crs.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let mut builder = las::Builder::from((1, 4));
+    builder.point_format = las::point::Format::new(6).unwrap();
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Projection".to_string(),
+        record_id: 34735,
+        description: "GeoTIFF GeoKeyDirectoryTag".to_string(),
+        data: vec![1, 1, 0, 0],
+    });
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
+
+    let err = convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("GeoTIFF-to-WKT CRS conversion"));
+    assert!(!message.contains("1 VLR(s)"));
 }
 
 #[test]
@@ -755,6 +911,10 @@ fn read_extended_return_counts(path: &std::path::Path) -> [u64; 15] {
         *count = file.read_u64::<LittleEndian>().unwrap();
     }
     counts
+}
+
+fn wgs84_wkt_vlr_data() -> Vec<u8> {
+    b"GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433],AUTHORITY[\"EPSG\",\"4326\"]]\0".to_vec()
 }
 
 fn source_bounds(points: &[CopcPointFields]) -> Bounds {

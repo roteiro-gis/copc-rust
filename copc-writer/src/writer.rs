@@ -28,8 +28,16 @@ const INDEX_RECORD_BYTES: u64 = 4;
 const MIN_LEAF_DEPTH: u32 = 21;
 const MAX_LEAF_DEPTH: u32 = 30;
 const LAS_14_SCAN_ANGLE_SCALE: f32 = 0.006;
+const LAS_VLR_HEADER_BYTES: u32 = 54;
+const LAS_EVLR_HEADER_BYTES: u64 = 60;
 const LASZIP_VLR_USER_ID: &str = "laszip encoded";
 const LASZIP_VLR_RECORD_ID: u16 = 22204;
+const LASF_PROJECTION_USER_ID: &str = "LASF_Projection";
+const WKT_CRS_RECORD_ID: u16 = 2112;
+const GEOTIFF_GEO_KEY_DIRECTORY_RECORD_ID: u16 = 34735;
+const GEOTIFF_DOUBLE_PARAMS_RECORD_ID: u16 = 34736;
+const GEOTIFF_ASCII_PARAMS_RECORD_ID: u16 = 34737;
+const WKT_GLOBAL_ENCODING_BIT: u16 = 16;
 
 /// Normalized point fields consumed by the COPC writer.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -351,6 +359,12 @@ impl CopcPointSource for SpillSource<'_> {
 }
 
 #[derive(Clone, Debug)]
+struct OutputCrsRecord {
+    vlr: las::Vlr,
+    is_extended: bool,
+}
+
+#[derive(Clone, Debug)]
 struct OutputLasMetadata {
     file_source_id: u16,
     global_encoding: u16,
@@ -361,6 +375,7 @@ struct OutputLasMetadata {
     creation_year: u16,
     scale: (f64, f64, f64),
     offset: Option<(f64, f64, f64)>,
+    crs_records: Vec<OutputCrsRecord>,
 }
 
 impl Default for OutputLasMetadata {
@@ -375,6 +390,7 @@ impl Default for OutputLasMetadata {
             creation_year: 2026,
             scale: (0.001, 0.001, 0.001),
             offset: None,
+            crs_records: Vec::new(),
         }
     }
 }
@@ -384,6 +400,10 @@ impl OutputLasMetadata {
         let mut global_encoding = u16::from(header.gps_time_type());
         if header.has_synthetic_return_numbers() {
             global_encoding |= 8;
+        }
+        let crs_records = extract_source_wkt_crs_records(header);
+        if !crs_records.is_empty() {
+            global_encoding |= WKT_GLOBAL_ENCODING_BIT;
         }
         let transforms = header.transforms();
         let (creation_day_of_year, creation_year) = header
@@ -409,7 +429,50 @@ impl OutputLasMetadata {
                 transforms.y.offset,
                 transforms.z.offset,
             )),
+            crs_records,
         }
+    }
+
+    fn regular_crs_vlrs(&self) -> impl Iterator<Item = &las::Vlr> {
+        self.crs_records
+            .iter()
+            .filter(|record| !record.is_extended)
+            .map(|record| &record.vlr)
+    }
+
+    fn extended_crs_evlrs(&self) -> impl Iterator<Item = &las::Vlr> {
+        self.crs_records
+            .iter()
+            .filter(|record| record.is_extended)
+            .map(|record| &record.vlr)
+    }
+
+    fn regular_crs_vlr_count(&self) -> usize {
+        self.crs_records
+            .iter()
+            .filter(|record| !record.is_extended)
+            .count()
+    }
+
+    fn extended_crs_evlr_count(&self) -> usize {
+        self.crs_records
+            .iter()
+            .filter(|record| record.is_extended)
+            .count()
+    }
+
+    fn regular_crs_vlr_bytes(&self) -> Result<u32> {
+        self.regular_crs_vlrs().try_fold(0u32, |total, vlr| {
+            let data_len = u16::try_from(vlr.data.len()).map_err(|_| {
+                Error::InvalidInput(format!(
+                    "regular WKT CRS VLR is too large: {} byte(s)",
+                    vlr.data.len()
+                ))
+            })?;
+            total
+                .checked_add(LAS_VLR_HEADER_BYTES + u32::from(data_len))
+                .ok_or_else(|| Error::InvalidInput("CRS VLR byte size overflow".into()))
+        })
     }
 }
 
@@ -574,16 +637,44 @@ fn validate_las_conversion_supported(header: &las::Header) -> Result<()> {
     if format.extra_bytes > 0 {
         unsupported.push(format!("{} extra point byte(s)", format.extra_bytes));
     }
-    let unsupported_vlr_count = header
-        .vlrs()
-        .iter()
-        .filter(|vlr| !is_laszip_vlr(vlr))
-        .count();
+    let source_has_wkt_crs_record = has_wkt_crs_record(header);
+    let mut geotiff_crs_record_count = 0usize;
+    let mut unsupported_vlr_count = 0usize;
+    for vlr in header.vlrs() {
+        if is_laszip_vlr(vlr) || is_wkt_crs_vlr(vlr) {
+            continue;
+        }
+        if is_geotiff_crs_vlr(vlr) {
+            if !source_has_wkt_crs_record {
+                geotiff_crs_record_count += 1;
+            }
+            continue;
+        }
+        unsupported_vlr_count += 1;
+    }
+    let mut unsupported_evlr_count = 0usize;
+    for evlr in header.evlrs() {
+        if is_wkt_crs_vlr(evlr) {
+            continue;
+        }
+        if is_geotiff_crs_vlr(evlr) {
+            if !source_has_wkt_crs_record {
+                geotiff_crs_record_count += 1;
+            }
+            continue;
+        }
+        unsupported_evlr_count += 1;
+    }
+    if geotiff_crs_record_count > 0 {
+        unsupported.push(format!(
+            "{geotiff_crs_record_count} GeoTIFF CRS VLR/EVLR(s); GeoTIFF-to-WKT CRS conversion is not implemented in copc-writer"
+        ));
+    }
     if unsupported_vlr_count > 0 {
         unsupported.push(format!("{unsupported_vlr_count} VLR(s)"));
     }
-    if !header.evlrs().is_empty() {
-        unsupported.push(format!("{} EVLR(s)", header.evlrs().len()));
+    if unsupported_evlr_count > 0 {
+        unsupported.push(format!("{unsupported_evlr_count} EVLR(s)"));
     }
     if !header.padding().is_empty() {
         unsupported.push(format!("{} header padding byte(s)", header.padding().len()));
@@ -613,6 +704,45 @@ fn validate_las_conversion_supported(header: &las::Header) -> Result<()> {
 
 fn is_laszip_vlr(vlr: &las::Vlr) -> bool {
     vlr.user_id == LASZIP_VLR_USER_ID && vlr.record_id == LASZIP_VLR_RECORD_ID
+}
+
+fn is_wkt_crs_vlr(vlr: &las::Vlr) -> bool {
+    vlr.user_id == LASF_PROJECTION_USER_ID && vlr.record_id == WKT_CRS_RECORD_ID
+}
+
+fn is_geotiff_crs_vlr(vlr: &las::Vlr) -> bool {
+    vlr.user_id == LASF_PROJECTION_USER_ID
+        && matches!(
+            vlr.record_id,
+            GEOTIFF_GEO_KEY_DIRECTORY_RECORD_ID
+                | GEOTIFF_DOUBLE_PARAMS_RECORD_ID
+                | GEOTIFF_ASCII_PARAMS_RECORD_ID
+        )
+}
+
+fn has_wkt_crs_record(header: &las::Header) -> bool {
+    header.vlrs().iter().any(is_wkt_crs_vlr) || header.evlrs().iter().any(is_wkt_crs_vlr)
+}
+
+fn extract_source_wkt_crs_records(header: &las::Header) -> Vec<OutputCrsRecord> {
+    let mut records = Vec::new();
+    for vlr in header.vlrs() {
+        if is_wkt_crs_vlr(vlr) {
+            records.push(OutputCrsRecord {
+                vlr: vlr.clone(),
+                is_extended: false,
+            });
+        }
+    }
+    for evlr in header.evlrs() {
+        if is_wkt_crs_vlr(evlr) {
+            records.push(OutputCrsRecord {
+                vlr: evlr.clone(),
+                is_extended: true,
+            });
+        }
+    }
+    records
 }
 
 fn validate_record_coordinates(record: &LasPointRecord, index: usize) -> Result<()> {
@@ -852,9 +982,32 @@ fn write_copc_inner<S: CopcPointSource>(
 
     let copc_info_vlr_size = 160u16;
     let las_header_size = 375u32;
-    let total_vlr_bytes =
-        (54u32 + u32::from(copc_info_vlr_size)) + (54u32 + var_vlr_bytes.len() as u32);
-    let offset_to_point_data = las_header_size + total_vlr_bytes;
+    let regular_crs_vlr_count = metadata.regular_crs_vlr_count();
+    let regular_crs_vlr_bytes = metadata.regular_crs_vlr_bytes()?;
+    let number_of_vlrs = u32::try_from(
+        2usize
+            .checked_add(regular_crs_vlr_count)
+            .ok_or_else(|| Error::InvalidInput("VLR count overflow".into()))?,
+    )
+    .map_err(|_| Error::InvalidInput("VLR count overflow".into()))?;
+    let number_of_evlrs = u32::try_from(
+        1usize
+            .checked_add(metadata.extended_crs_evlr_count())
+            .ok_or_else(|| Error::InvalidInput("EVLR count overflow".into()))?,
+    )
+    .map_err(|_| Error::InvalidInput("EVLR count overflow".into()))?;
+    let var_vlr_body_size = u16::try_from(var_vlr_bytes.len())
+        .map_err(|_| Error::InvalidInput("LAZ VLR byte size exceeds LAS VLR limit".into()))?;
+    let var_vlr_storage_bytes = LAS_VLR_HEADER_BYTES
+        .checked_add(u32::from(var_vlr_body_size))
+        .ok_or_else(|| Error::InvalidInput("LAZ VLR byte size overflow".into()))?;
+    let total_vlr_bytes = (LAS_VLR_HEADER_BYTES + u32::from(copc_info_vlr_size))
+        .checked_add(regular_crs_vlr_bytes)
+        .and_then(|total| total.checked_add(var_vlr_storage_bytes))
+        .ok_or_else(|| Error::InvalidInput("VLR byte size overflow".into()))?;
+    let offset_to_point_data = las_header_size
+        .checked_add(total_vlr_bytes)
+        .ok_or_else(|| Error::InvalidInput("point data offset overflow".into()))?;
 
     let file = File::create(path).map_err(|e| Error::io("create COPC file", e))?;
     let mut writer = BufWriter::new(file);
@@ -863,7 +1016,7 @@ fn write_copc_inner<S: CopcPointSource>(
         point_data_format: point_format_id | 0x80,
         point_record_length,
         offset_to_point_data,
-        number_of_vlrs: 2,
+        number_of_vlrs,
         file_source_id: metadata.file_source_id,
         global_encoding: metadata.global_encoding,
         guid: metadata.guid,
@@ -877,7 +1030,7 @@ fn write_copc_inner<S: CopcPointSource>(
         legacy_point_count: 0,
         total_point_count: source.len() as u64,
         offset_to_first_evlr: 0,
-        number_of_evlrs: 1,
+        number_of_evlrs,
         extended_return_counts: point_stats.extended_return_counts,
     };
     header.write(&mut writer)?;
@@ -890,11 +1043,15 @@ fn write_copc_inner<S: CopcPointSource>(
         .write_all(&[0u8; 160])
         .map_err(|e| Error::io("write COPC info placeholder", e))?;
 
+    for vlr in metadata.regular_crs_vlrs() {
+        write_las_vlr(&mut writer, vlr)?;
+    }
+
     write_vlr_header(
         &mut writer,
         LASZIP_VLR_USER_ID,
         LASZIP_VLR_RECORD_ID,
-        var_vlr_bytes.len() as u16,
+        var_vlr_body_size,
         "http://laszip.org",
     )?;
     writer
@@ -975,11 +1132,17 @@ fn write_copc_inner<S: CopcPointSource>(
         .map_err(|e| Error::Las(format!("finish compressor: {e}")))?;
     drop(compressor);
 
-    let evlr_start = writer
+    let first_evlr_start = writer
         .stream_position()
-        .map_err(|e| Error::io("record EVLR start", e))?;
-    let root_hier_offset = evlr_start
-        .checked_add(60)
+        .map_err(|e| Error::io("record first EVLR start", e))?;
+    for evlr in metadata.extended_crs_evlrs() {
+        write_las_evlr(&mut writer, evlr)?;
+    }
+    let hierarchy_evlr_start = writer
+        .stream_position()
+        .map_err(|e| Error::io("record hierarchy EVLR start", e))?;
+    let root_hier_offset = hierarchy_evlr_start
+        .checked_add(LAS_EVLR_HEADER_BYTES)
         .ok_or_else(|| Error::InvalidInput("hierarchy EVLR offset overflow".into()))?;
     let mut hierarchy_pages = plan_hierarchy_pages(&hierarchy, VoxelKey::root())?;
     let hierarchy_end = assign_hierarchy_page_offsets(&mut hierarchy_pages, root_hier_offset)?;
@@ -1023,7 +1186,7 @@ fn write_copc_inner<S: CopcPointSource>(
         .seek(SeekFrom::Start(235))
         .map_err(|e| Error::io("seek first EVLR offset", e))?;
     writer
-        .write_u64::<LittleEndian>(evlr_start)
+        .write_u64::<LittleEndian>(first_evlr_start)
         .map_err(|e| Error::io("patch first EVLR offset", e))?;
 
     writer
@@ -1661,6 +1824,28 @@ fn write_vlr_header<W: Write>(
     Ok(())
 }
 
+fn write_las_vlr<W: Write>(writer: &mut W, vlr: &las::Vlr) -> Result<()> {
+    let body_size = u16::try_from(vlr.data.len()).map_err(|_| {
+        Error::InvalidInput(format!(
+            "regular VLR {}:{} is too large: {} byte(s)",
+            vlr.user_id,
+            vlr.record_id,
+            vlr.data.len()
+        ))
+    })?;
+    write_vlr_header(
+        writer,
+        &vlr.user_id,
+        vlr.record_id,
+        body_size,
+        &vlr.description,
+    )?;
+    writer
+        .write_all(&vlr.data)
+        .map_err(|e| Error::io("write VLR body", e))?;
+    Ok(())
+}
+
 fn write_evlr_header<W: Write>(
     writer: &mut W,
     user_id: &str,
@@ -1683,6 +1868,28 @@ fn write_evlr_header<W: Write>(
     writer
         .write_all(&pad(description.as_bytes(), 32))
         .map_err(|e| Error::io("write EVLR description", e))?;
+    Ok(())
+}
+
+fn write_las_evlr<W: Write>(writer: &mut W, vlr: &las::Vlr) -> Result<()> {
+    let body_size = u64::try_from(vlr.data.len()).map_err(|_| {
+        Error::InvalidInput(format!(
+            "EVLR {}:{} is too large: {} byte(s)",
+            vlr.user_id,
+            vlr.record_id,
+            vlr.data.len()
+        ))
+    })?;
+    write_evlr_header(
+        writer,
+        &vlr.user_id,
+        vlr.record_id,
+        body_size,
+        &vlr.description,
+    )?;
+    writer
+        .write_all(&vlr.data)
+        .map_err(|e| Error::io("write EVLR body", e))?;
     Ok(())
 }
 
