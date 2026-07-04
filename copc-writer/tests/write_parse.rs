@@ -832,60 +832,7 @@ fn streaming_conversion_preserves_combined_extra_bytes_metadata_and_crs() {
     let spill_dir = dir.path().join("spill");
     std::fs::create_dir(&spill_dir).unwrap();
 
-    let wkt = wgs84_wkt_vlr_data();
-    let extra_descriptor = extra_bytes_descriptor_vlr_data();
-    let custom_vlr_data = b"combined source vlr".to_vec();
-    let custom_evlr_data = b"combined source evlr payload".to_vec();
-
-    let mut format = las::point::Format::new(7).unwrap();
-    format.extra_bytes = 3;
-    let mut builder = las::Builder::from((1, 4));
-    builder.has_wkt_crs = true;
-    builder.point_format = format;
-    builder.transforms = las::Vector {
-        x: las::Transform {
-            scale: 0.01,
-            offset: 500_000.0,
-        },
-        y: las::Transform {
-            scale: 0.01,
-            offset: 4_100_000.0,
-        },
-        z: las::Transform {
-            scale: 0.01,
-            offset: 100.0,
-        },
-    };
-    builder.vlrs.push(las::Vlr {
-        user_id: "LASF_Projection".to_string(),
-        record_id: 2112,
-        description: "OGC WKT CRS".to_string(),
-        data: wkt.clone(),
-    });
-    builder.vlrs.push(las::Vlr {
-        user_id: "LASF_Spec".to_string(),
-        record_id: 4,
-        description: "Extra bytes".to_string(),
-        data: extra_descriptor.clone(),
-    });
-    builder.vlrs.push(las::Vlr {
-        user_id: "shape_test".to_string(),
-        record_id: 77,
-        description: "source metadata".to_string(),
-        data: custom_vlr_data.clone(),
-    });
-    builder.evlrs.push(las::Vlr {
-        user_id: "shape_test".to_string(),
-        record_id: 78,
-        description: "source extended metadata".to_string(),
-        data: custom_evlr_data.clone(),
-    });
-
-    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
-    for point in combined_metadata_shape_points() {
-        writer.write(point).unwrap();
-    }
-    writer.close().unwrap();
+    write_combined_metadata_shape_las(&las_path);
 
     let mut source_reader = las::Reader::from_path(&las_path).unwrap();
     let source_wkt = source_reader
@@ -900,6 +847,13 @@ fn streaming_conversion_preserves_combined_extra_bytes_metadata_and_crs() {
         .vlrs()
         .iter()
         .find(|vlr| vlr.user_id == "shape_test" && vlr.record_id == 77)
+        .unwrap()
+        .clone();
+    let source_extra_descriptor = source_reader
+        .header()
+        .vlrs()
+        .iter()
+        .find(|vlr| vlr.user_id == "LASF_Spec" && vlr.record_id == 4)
         .unwrap()
         .clone();
     let source_points = source_reader
@@ -950,9 +904,12 @@ fn streaming_conversion_preserves_combined_extra_bytes_metadata_and_crs() {
     assert_eq!("LASF_Projection", vlrs[2].user_id);
     assert_eq!(2112, vlrs[2].record_id);
     assert_eq!(source_wkt.as_slice(), vlrs[2].data.as_slice());
-    assert_eq!("LASF_Spec", vlrs[3].user_id);
-    assert_eq!(4, vlrs[3].record_id);
-    assert_eq!(extra_descriptor.as_slice(), vlrs[3].data.as_slice());
+    assert_eq!(source_extra_descriptor.user_id, vlrs[3].user_id);
+    assert_eq!(source_extra_descriptor.record_id, vlrs[3].record_id);
+    assert_eq!(
+        source_extra_descriptor.data.as_slice(),
+        vlrs[3].data.as_slice()
+    );
     assert_eq!(source_custom_vlr.user_id, vlrs[4].user_id);
     assert_eq!(source_custom_vlr.record_id, vlrs[4].record_id);
     assert_eq!(source_custom_vlr.description, vlrs[4].description);
@@ -965,6 +922,137 @@ fn streaming_conversion_preserves_combined_extra_bytes_metadata_and_crs() {
     assert_las_points_match_points(&source_points, &las_points);
 
     let evlrs = read_las_evlrs(&copc_path);
+    assert_eq!(2, evlrs.len());
+    assert_eq!("copc", evlrs[0].user_id);
+    assert_eq!(1000, evlrs[0].record_id);
+    assert_eq!(source_custom_evlr.user_id, evlrs[1].user_id);
+    assert_eq!(source_custom_evlr.record_id, evlrs[1].record_id);
+    assert_eq!(source_custom_evlr.description, evlrs[1].description);
+    assert_eq!(source_custom_evlr.data.as_slice(), evlrs[1].data.as_slice());
+}
+
+#[test]
+fn streaming_conversion_preserves_combined_shape_from_copc_laz_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("combined-source.las");
+    let source_copc_path = dir.path().join("combined-source.copc.laz");
+    let output_copc_path = dir.path().join("combined-source-reencoded.copc.laz");
+    let first_spill_dir = dir.path().join("spill-first");
+    let second_spill_dir = dir.path().join("spill-second");
+    std::fs::create_dir(&first_spill_dir).unwrap();
+    std::fs::create_dir(&second_spill_dir).unwrap();
+
+    write_combined_metadata_shape_las(&las_path);
+    let params = CopcWriterParams {
+        max_points_per_node: 16,
+        max_depth: 4,
+    };
+    convert_las_to_copc_streaming(
+        &las_path,
+        &source_copc_path,
+        &params,
+        &first_spill_dir,
+        &NeverCancel,
+    )
+    .unwrap();
+
+    let source_header = read_las_header_prefix(&source_copc_path);
+    assert_eq!(5, source_header.number_of_vlrs);
+    assert_eq!(2, source_header.number_of_evlrs);
+    let source_evlrs = read_las_evlrs(&source_copc_path);
+    assert!(source_evlrs
+        .iter()
+        .any(|evlr| evlr.user_id == "copc" && evlr.record_id == 1000));
+
+    let mut source_reader = las::Reader::from_path(&source_copc_path).unwrap();
+    assert_eq!(7, source_reader.header().point_format().to_u8().unwrap());
+    assert_eq!(3, source_reader.header().point_format().extra_bytes);
+    assert!(source_reader.header().has_wkt_crs());
+    let source_wkt = source_reader
+        .header()
+        .all_vlrs()
+        .find(|vlr| vlr.user_id == "LASF_Projection" && vlr.record_id == 2112)
+        .unwrap()
+        .data
+        .clone();
+    let source_extra_descriptor = source_reader
+        .header()
+        .vlrs()
+        .iter()
+        .find(|vlr| vlr.user_id == "LASF_Spec" && vlr.record_id == 4)
+        .unwrap()
+        .clone();
+    let source_custom_vlr = source_reader
+        .header()
+        .vlrs()
+        .iter()
+        .find(|vlr| vlr.user_id == "shape_test" && vlr.record_id == 77)
+        .unwrap()
+        .clone();
+    let source_points = source_reader
+        .points()
+        .collect::<las::Result<Vec<_>>>()
+        .unwrap();
+    let source_custom_evlr = source_evlrs
+        .iter()
+        .find(|evlr| evlr.user_id == "shape_test" && evlr.record_id == 78)
+        .unwrap()
+        .clone();
+
+    convert_las_to_copc_streaming(
+        &source_copc_path,
+        &output_copc_path,
+        &params,
+        &second_spill_dir,
+        &NeverCancel,
+    )
+    .unwrap();
+
+    let mut copc_reader =
+        CopcReader::open(std::fs::File::open(&output_copc_path).unwrap()).unwrap();
+    let copc_points = copc_reader
+        .points(LodSelection::All, BoundsSelection::All)
+        .unwrap()
+        .collect::<copc_core::Result<Vec<_>>>()
+        .unwrap();
+    assert_las_points_match_points(&source_points, &copc_points);
+
+    let output_header = read_las_header_prefix(&output_copc_path);
+    assert_eq!(16, output_header.global_encoding & 16);
+    assert_eq!(5, output_header.number_of_vlrs);
+    assert_eq!(2, output_header.number_of_evlrs);
+
+    let mut las_reader = las::Reader::from_path(&output_copc_path).unwrap();
+    assert_eq!(7, las_reader.header().point_format().to_u8().unwrap());
+    assert_eq!(3, las_reader.header().point_format().extra_bytes);
+    assert!(las_reader.header().has_wkt_crs());
+    let vlrs = las_reader.header().vlrs();
+    assert_eq!(5, vlrs.len());
+    assert_eq!("copc", vlrs[0].user_id);
+    assert_eq!(1, vlrs[0].record_id);
+    assert_eq!("laszip encoded", vlrs[1].user_id);
+    assert_eq!(22204, vlrs[1].record_id);
+    assert_eq!("LASF_Projection", vlrs[2].user_id);
+    assert_eq!(2112, vlrs[2].record_id);
+    assert_eq!(source_wkt.as_slice(), vlrs[2].data.as_slice());
+    assert_eq!(source_extra_descriptor.user_id, vlrs[3].user_id);
+    assert_eq!(source_extra_descriptor.record_id, vlrs[3].record_id);
+    assert_eq!(
+        source_extra_descriptor.data.as_slice(),
+        vlrs[3].data.as_slice()
+    );
+    assert_eq!(source_custom_vlr.user_id, vlrs[4].user_id);
+    assert_eq!(source_custom_vlr.record_id, vlrs[4].record_id);
+    assert_eq!(source_custom_vlr.description, vlrs[4].description);
+    assert_eq!(source_custom_vlr.data.as_slice(), vlrs[4].data.as_slice());
+
+    let las_points = las_reader
+        .points()
+        .collect::<las::Result<Vec<_>>>()
+        .unwrap();
+    assert_las_points_match_points(&source_points, &las_points);
+
+    let evlrs = read_las_evlrs(&output_copc_path);
     assert_eq!(2, evlrs.len());
     assert_eq!("copc", evlrs[0].user_id);
     assert_eq!(1000, evlrs[0].record_id);
@@ -1206,6 +1294,58 @@ fn extra_bytes_descriptor_vlr_data() -> Vec<u8> {
     let description = b"three raw extra bytes";
     data[160..160 + description.len()].copy_from_slice(description);
     data
+}
+
+fn write_combined_metadata_shape_las(path: &std::path::Path) {
+    let mut format = las::point::Format::new(7).unwrap();
+    format.extra_bytes = 3;
+    let mut builder = las::Builder::from((1, 4));
+    builder.has_wkt_crs = true;
+    builder.point_format = format;
+    builder.transforms = las::Vector {
+        x: las::Transform {
+            scale: 0.01,
+            offset: 500_000.0,
+        },
+        y: las::Transform {
+            scale: 0.01,
+            offset: 4_100_000.0,
+        },
+        z: las::Transform {
+            scale: 0.01,
+            offset: 100.0,
+        },
+    };
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Projection".to_string(),
+        record_id: 2112,
+        description: "OGC WKT CRS".to_string(),
+        data: wgs84_wkt_vlr_data(),
+    });
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Spec".to_string(),
+        record_id: 4,
+        description: "Extra bytes".to_string(),
+        data: extra_bytes_descriptor_vlr_data(),
+    });
+    builder.vlrs.push(las::Vlr {
+        user_id: "shape_test".to_string(),
+        record_id: 77,
+        description: "source metadata".to_string(),
+        data: b"combined source vlr".to_vec(),
+    });
+    builder.evlrs.push(las::Vlr {
+        user_id: "shape_test".to_string(),
+        record_id: 78,
+        description: "source extended metadata".to_string(),
+        data: b"combined source evlr payload".to_vec(),
+    });
+
+    let mut writer = las::Writer::from_path(path, builder.into_header().unwrap()).unwrap();
+    for point in combined_metadata_shape_points() {
+        writer.write(point).unwrap();
+    }
+    writer.close().unwrap();
 }
 
 fn combined_metadata_shape_points() -> Vec<Point> {

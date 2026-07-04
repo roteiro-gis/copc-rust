@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.4.1 - 2026-07-04
+
+- preserve source EVLRs when converting from COPC/LAZ inputs whose EVLR list
+  extends beyond the first COPC hierarchy record
+- add a compressed COPC/LAZ-input round-trip gate covering WKT CRS, LAS Extra
+  Bytes, a non-CRS VLR, and a source EVLR
+- increase bounded spill, index, source, and output I/O buffers used by
+  streaming conversion
+
 ## 0.4.0 - 2026-07-04
 
 - preserve WKT CRS records during LAS/LAZ-to-COPC conversion and set the LAS

@@ -40,6 +40,9 @@ const GEOTIFF_ASCII_PARAMS_RECORD_ID: u16 = 34737;
 const LASF_SPEC_USER_ID: &str = "LASF_Spec";
 const EXTRA_BYTES_RECORD_ID: u16 = 4;
 const WKT_GLOBAL_ENCODING_BIT: u16 = 16;
+const LAS_INPUT_BUFFER_BYTES: usize = 1024 * 1024;
+const COPC_OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
+const INDEX_IO_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Normalized point fields consumed by the COPC writer.
 #[derive(Clone, Debug, PartialEq)]
@@ -472,17 +475,17 @@ impl Default for OutputLasMetadata {
 }
 
 impl OutputLasMetadata {
-    fn from_las_header(header: &las::Header) -> Self {
+    fn from_las_header(header: &las::Header, source_evlrs: &[las::Vlr]) -> Self {
         let mut global_encoding = u16::from(header.gps_time_type());
         if header.has_synthetic_return_numbers() {
             global_encoding |= 8;
         }
-        let crs_records = extract_source_wkt_crs_records(header);
+        let crs_records = extract_source_wkt_crs_records(header, source_evlrs);
         if !crs_records.is_empty() {
             global_encoding |= WKT_GLOBAL_ENCODING_BIT;
         }
         let pass_through_vlrs = extract_pass_through_vlrs(header);
-        let pass_through_evlrs = extract_pass_through_evlrs(header);
+        let pass_through_evlrs = extract_pass_through_evlrs(source_evlrs);
         let transforms = header.transforms();
         let (creation_day_of_year, creation_year) = header
             .date()
@@ -677,9 +680,12 @@ pub fn convert_las_to_copc_streaming(
     cancel: &dyn CancelCheck,
 ) -> Result<()> {
     cancel.check()?;
-    let mut reader = las::Reader::from_path(las_path).map_err(|e| Error::Las(e.to_string()))?;
-    validate_las_conversion_supported(reader.header())?;
-    let output_metadata = OutputLasMetadata::from_las_header(reader.header());
+    let las_file = File::open(las_path).map_err(|e| Error::io("open source LAS/LAZ", e))?;
+    let mut reader = las::Reader::new(BufReader::with_capacity(LAS_INPUT_BUFFER_BYTES, las_file))
+        .map_err(|e| Error::Las(e.to_string()))?;
+    let source_evlrs = read_all_source_evlrs(las_path)?;
+    validate_las_conversion_supported(reader.header(), &source_evlrs)?;
+    let output_metadata = OutputLasMetadata::from_las_header(reader.header(), &source_evlrs);
     let layout = StreamingLayout::from_las_header(reader.header());
     let mut spill = SpillWriter::create(spill_dir, layout)?;
     for (index, result) in reader.points().enumerate() {
@@ -694,6 +700,28 @@ pub fn convert_las_to_copc_streaming(
     cancel.check()?;
     let reader = spill.finalize()?;
     write_copc_from_spill(copc_path, reader, params, cancel, &output_metadata)
+}
+
+fn read_all_source_evlrs(path: &Path) -> Result<Vec<las::Vlr>> {
+    let mut file = File::open(path).map_err(|e| Error::io("open source LAS/LAZ", e))?;
+    let raw_header =
+        raw::Header::read_from(&mut file).map_err(|e| Error::Las(format!("source header: {e}")))?;
+    let Some(evlr_header) = raw_header.evlr else {
+        return Ok(Vec::new());
+    };
+
+    file.seek(SeekFrom::Start(evlr_header.start_of_first_evlr))
+        .map_err(|e| Error::io("seek source EVLRs", e))?;
+    let evlr_count = usize::try_from(evlr_header.number_of_evlrs)
+        .map_err(|_| Error::InvalidInput("source EVLR count overflows usize".into()))?;
+    let mut evlrs = Vec::with_capacity(evlr_count);
+    for index in 0..evlr_header.number_of_evlrs {
+        let evlr = raw::Vlr::read_from(&mut file, true)
+            .map(las::Vlr::new)
+            .map_err(|e| Error::Las(format!("source EVLR {index}: {e}")))?;
+        evlrs.push(evlr);
+    }
+    Ok(evlrs)
 }
 
 fn validate_streaming_layout_supported(layout: &StreamingLayout) -> Result<()> {
@@ -714,7 +742,10 @@ fn validate_streaming_layout_supported(layout: &StreamingLayout) -> Result<()> {
     }
 }
 
-fn validate_las_conversion_supported(header: &las::Header) -> Result<()> {
+fn validate_las_conversion_supported(
+    header: &las::Header,
+    source_evlrs: &[las::Vlr],
+) -> Result<()> {
     let mut unsupported = Vec::new();
     let format = header.point_format();
     if format.has_nir {
@@ -723,14 +754,14 @@ fn validate_las_conversion_supported(header: &las::Header) -> Result<()> {
     if format.has_waveform {
         unsupported.push("waveform point data".to_string());
     }
-    let source_has_wkt_crs_record = has_wkt_crs_record(header);
+    let source_has_wkt_crs_record = has_wkt_crs_record(header, source_evlrs);
     let mut geotiff_crs_record_count = 0usize;
     for vlr in header.vlrs() {
         if is_geotiff_crs_vlr(vlr) && !source_has_wkt_crs_record {
             geotiff_crs_record_count += 1;
         }
     }
-    for evlr in header.evlrs() {
+    for evlr in source_evlrs {
         if is_geotiff_crs_vlr(evlr) && !source_has_wkt_crs_record {
             geotiff_crs_record_count += 1;
         }
@@ -781,11 +812,14 @@ fn is_extra_bytes_descriptor_vlr(vlr: &las::Vlr) -> bool {
     vlr.user_id == LASF_SPEC_USER_ID && vlr.record_id == EXTRA_BYTES_RECORD_ID
 }
 
-fn has_wkt_crs_record(header: &las::Header) -> bool {
-    header.vlrs().iter().any(is_wkt_crs_vlr) || header.evlrs().iter().any(is_wkt_crs_vlr)
+fn has_wkt_crs_record(header: &las::Header, source_evlrs: &[las::Vlr]) -> bool {
+    header.vlrs().iter().any(is_wkt_crs_vlr) || source_evlrs.iter().any(is_wkt_crs_vlr)
 }
 
-fn extract_source_wkt_crs_records(header: &las::Header) -> Vec<OutputCrsRecord> {
+fn extract_source_wkt_crs_records(
+    header: &las::Header,
+    source_evlrs: &[las::Vlr],
+) -> Vec<OutputCrsRecord> {
     let mut records = Vec::new();
     for vlr in header.vlrs() {
         if is_wkt_crs_vlr(vlr) {
@@ -795,7 +829,7 @@ fn extract_source_wkt_crs_records(header: &las::Header) -> Vec<OutputCrsRecord> 
             });
         }
     }
-    for evlr in header.evlrs() {
+    for evlr in source_evlrs {
         if is_wkt_crs_vlr(evlr) {
             records.push(OutputCrsRecord {
                 vlr: evlr.clone(),
@@ -820,9 +854,8 @@ fn extract_pass_through_vlrs(header: &las::Header) -> Vec<las::Vlr> {
         .collect()
 }
 
-fn extract_pass_through_evlrs(header: &las::Header) -> Vec<las::Vlr> {
-    header
-        .evlrs()
+fn extract_pass_through_evlrs(source_evlrs: &[las::Vlr]) -> Vec<las::Vlr> {
+    source_evlrs
         .iter()
         .filter(|evlr| !is_laszip_vlr(evlr))
         .filter(|evlr| !is_copc_info_vlr(evlr))
@@ -1115,7 +1148,7 @@ fn write_copc_inner<S: CopcPointSource>(
         .ok_or_else(|| Error::InvalidInput("point data offset overflow".into()))?;
 
     let file = File::create(path).map_err(|e| Error::io("create COPC file", e))?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(COPC_OUTPUT_BUFFER_BYTES, file);
 
     let header = LasHeader {
         point_data_format: point_format_id | 0x80,
@@ -1182,8 +1215,10 @@ fn write_copc_inner<S: CopcPointSource>(
         .map_err(|e| Error::Las(format!("compressor: {e}")))?;
     let mut hierarchy: Vec<Entry> = Vec::with_capacity(lod_index.nodes.len());
     let order_path: &Path = lod_index.order_path.as_ref();
-    let mut index_reader =
-        BufReader::new(File::open(order_path).map_err(|e| Error::io("open LOD order", e))?);
+    let mut index_reader = BufReader::with_capacity(
+        INDEX_IO_BUFFER_BYTES,
+        File::open(order_path).map_err(|e| Error::io("open LOD order", e))?,
+    );
     let mut point_buf = vec![0u8; point_record_length as usize];
     let mut chunk_start_file_offset = compressor
         .get_mut()
@@ -1498,7 +1533,8 @@ fn build_lod_index<S: CopcPointSource>(
     let mut order_offset = 0;
     let mut nodes = Vec::new();
     {
-        let mut order_writer = BufWriter::new(order_file.as_file_mut());
+        let mut order_writer =
+            BufWriter::with_capacity(INDEX_IO_BUFFER_BYTES, order_file.as_file_mut());
         let mut builder = LodIndexBuilder {
             source,
             max_points_per_node,
@@ -1584,7 +1620,7 @@ impl<S: CopcPointSource, W: Write> LodIndexBuilder<'_, S, W> {
 }
 
 fn write_root_index_run(total_points: u32, cancel: &dyn CancelCheck) -> Result<IndexRun> {
-    let mut writer = BufWriter::new(new_index_tempfile("root")?);
+    let mut writer = BufWriter::with_capacity(INDEX_IO_BUFFER_BYTES, new_index_tempfile("root")?);
     for index in 0..total_points {
         if index as usize % CANCEL_POLL_STRIDE == 0 {
             cancel.check()?;
@@ -1612,6 +1648,7 @@ fn partition_index_run<S: CopcPointSource>(
     let mut reader = open_index_run(run)?;
     let mut writers: [Option<BufWriter<NamedTempFile>>; 8] = std::array::from_fn(|_| None);
     let mut counts = [0usize; 8];
+    let center = bounds.center();
     for read_index in 0..run.count {
         if read_index % CANCEL_POLL_STRIDE == 0 {
             cancel.check()?;
@@ -1620,9 +1657,12 @@ fn partition_index_run<S: CopcPointSource>(
             .read_u32::<LittleEndian>()
             .map_err(|e| Error::io("read LOD partition index", e))?;
         let (x, y, z) = source.xyz(index as usize);
-        let octant = child_octant(bounds, x, y, z);
+        let octant = child_octant(center, x, y, z);
         if writers[octant].is_none() {
-            writers[octant] = Some(BufWriter::new(new_index_tempfile("partition")?));
+            writers[octant] = Some(BufWriter::with_capacity(
+                INDEX_IO_BUFFER_BYTES,
+                new_index_tempfile("partition")?,
+            ));
         }
         writers[octant]
             .as_mut()
@@ -1733,7 +1773,7 @@ fn open_index_run(run: &IndexRun) -> Result<BufReader<File>> {
     let mut file = File::open(path).map_err(|e| Error::io("open LOD index", e))?;
     file.seek(SeekFrom::Start(run.start))
         .map_err(|e| Error::io("seek LOD index", e))?;
-    Ok(BufReader::new(file))
+    Ok(BufReader::with_capacity(INDEX_IO_BUFFER_BYTES, file))
 }
 
 fn new_index_tempfile(label: &str) -> Result<NamedTempFile> {
@@ -1745,8 +1785,7 @@ fn new_index_tempfile(label: &str) -> Result<NamedTempFile> {
         .map_err(|e| Error::io("create LOD index file", e))
 }
 
-fn child_octant(bounds: Bounds, x: f64, y: f64, z: f64) -> usize {
-    let center = bounds.center();
+fn child_octant(center: (f64, f64, f64), x: f64, y: f64, z: f64) -> usize {
     usize::from(x >= center.0)
         | (usize::from(y >= center.1) << 1)
         | (usize::from(z >= center.2) << 2)
