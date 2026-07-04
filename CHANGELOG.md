@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-07-04
+
+- preserve WKT CRS records during LAS/LAZ-to-COPC conversion and set the LAS
+  WKT global-encoding bit when a WKT CRS is carried through
+- preserve LAS Extra Bytes point payloads and LASF_Spec Extra Bytes descriptor
+  VLRs through streaming conversion, disk spill, LAZ encoding, and read-back
+- pass through source non-CRS VLRs and EVLRs while regenerating COPC info,
+  LASzip, CRS, hierarchy, and Extra Bytes records in the required output order
+- keep streaming conversion out-of-core by carrying Extra Bytes through the
+  spill file and retaining the temp-file-backed LOD index path
+- add release gates for combined CRS, Extra Bytes, VLR, and EVLR round-trips,
+  plus structural and opt-in large-N bounded-memory writer guards
+- reject GeoTIFF-only CRS inputs with a specific unsupported-conversion error
+  until GeoTIFF-to-WKT conversion is implemented
+- breaking: `LasPointRecord` now carries raw `extra_bytes`, and
+  `StreamingLayout` now carries `extra_bytes` plus Extra Bytes descriptor VLRs
+
 ## 0.3.0 - 2026-06-22
 
 - add LAS/COPC-native column types in `copc-core`, materialized column reads in
