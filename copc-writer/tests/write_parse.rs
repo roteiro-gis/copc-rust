@@ -1339,7 +1339,10 @@ fn assert_las_points_match_points(expected: &[Point], actual: &[Point]) {
         assert_eq!(expected.return_number, actual.return_number);
         assert_eq!(expected.number_of_returns, actual.number_of_returns);
         assert_eq!(expected.scan_direction, actual.scan_direction);
-        assert_eq!(expected.is_edge_of_flight_line, actual.is_edge_of_flight_line);
+        assert_eq!(
+            expected.is_edge_of_flight_line,
+            actual.is_edge_of_flight_line
+        );
         assert_eq!(expected.classification, actual.classification);
         assert_eq!(expected.is_synthetic, actual.is_synthetic);
         assert_eq!(expected.is_key_point, actual.is_key_point);

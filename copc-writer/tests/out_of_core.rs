@@ -58,10 +58,8 @@ fn large_streaming_conversion_peak_rss_stays_bounded() {
     let extra_bytes = env_usize("COPC_WRITER_MEMORY_GUARD_EXTRA_BYTES", 32);
     let extra_byte_width =
         u16::try_from(extra_bytes).expect("COPC_WRITER_MEMORY_GUARD_EXTRA_BYTES exceeds u16");
-    let max_peak_rss_growth = env_usize(
-        "COPC_WRITER_MEMORY_GUARD_MAX_RSS_BYTES",
-        512 * 1024 * 1024,
-    ) as u64;
+    let max_peak_rss_growth =
+        env_usize("COPC_WRITER_MEMORY_GUARD_MAX_RSS_BYTES", 512 * 1024 * 1024) as u64;
 
     let dir = tempfile::tempdir().unwrap();
     let out_path = dir.path().join("large-bounded-memory.copc.laz");
@@ -176,9 +174,7 @@ fn record(index: usize, extra_byte_count: usize) -> LasPointRecord {
 }
 
 fn production_section(src: &'static str) -> &'static str {
-    src.split("\n#[cfg(test)]\nmod tests")
-        .next()
-        .unwrap_or(src)
+    src.split("\n#[cfg(test)]\nmod tests").next().unwrap_or(src)
 }
 
 fn assert_contains(haystack: &str, needle: &str) {
