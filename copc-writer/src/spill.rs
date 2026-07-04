@@ -12,6 +12,8 @@ use copc_core::{
 use memmap2::Mmap;
 use tempfile::{NamedTempFile, TempPath};
 
+const SPILL_IO_BUFFER_BYTES: usize = 1024 * 1024;
+
 /// Streams `LasPointRecord` values to a process-local temporary spill file.
 pub struct SpillWriter {
     #[cfg(test)]
@@ -37,7 +39,7 @@ impl SpillWriter {
         Ok(Self {
             #[cfg(test)]
             path,
-            file: Some(BufWriter::new(file)),
+            file: Some(BufWriter::with_capacity(SPILL_IO_BUFFER_BYTES, file)),
             layout,
             record_width,
             scratch: vec![0u8; record_width],
