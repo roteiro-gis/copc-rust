@@ -104,6 +104,8 @@ behind a future optional feature.
 - Source-trait writer API for caller-owned point storage
 - COPC writing from neutral `LasColumnBatch` values via `ColumnBatchSource`
 - Streaming LAS/LAZ-to-COPC conversion through a disk-backed mmap spill
+- Streaming conversion preserves WKT CRS records, LAS Extra Bytes payloads and
+  descriptors, and source non-CRS VLRs/EVLRs
 - LAS 1.4 point formats 6 and 7 with LAZ variable-size chunks
 - Interior-node representative points for native LOD reads
 
@@ -111,6 +113,7 @@ behind a future optional feature.
 
 - Zero-copy column views directly over compressed COPC/LAZ point data
 - Built-in Arrow or DataFusion conversion
+- GeoTIFF-only CRS conversion to WKT during LAS/LAZ-to-COPC conversion
 
 ## Testing
 
