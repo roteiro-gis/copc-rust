@@ -825,6 +825,156 @@ fn streaming_conversion_preserves_non_crs_vlrs_and_evlrs() {
 }
 
 #[test]
+fn streaming_conversion_preserves_combined_extra_bytes_metadata_and_crs() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("combined-metadata-shape.las");
+    let copc_path = dir.path().join("combined-metadata-shape.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    let wkt = wgs84_wkt_vlr_data();
+    let extra_descriptor = extra_bytes_descriptor_vlr_data();
+    let custom_vlr_data = b"combined source vlr".to_vec();
+    let custom_evlr_data = b"combined source evlr payload".to_vec();
+
+    let mut format = las::point::Format::new(7).unwrap();
+    format.extra_bytes = 3;
+    let mut builder = las::Builder::from((1, 4));
+    builder.has_wkt_crs = true;
+    builder.point_format = format;
+    builder.transforms = las::Vector {
+        x: las::Transform {
+            scale: 0.01,
+            offset: 500_000.0,
+        },
+        y: las::Transform {
+            scale: 0.01,
+            offset: 4_100_000.0,
+        },
+        z: las::Transform {
+            scale: 0.01,
+            offset: 100.0,
+        },
+    };
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Projection".to_string(),
+        record_id: 2112,
+        description: "OGC WKT CRS".to_string(),
+        data: wkt.clone(),
+    });
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Spec".to_string(),
+        record_id: 4,
+        description: "Extra bytes".to_string(),
+        data: extra_descriptor.clone(),
+    });
+    builder.vlrs.push(las::Vlr {
+        user_id: "shape_test".to_string(),
+        record_id: 77,
+        description: "source metadata".to_string(),
+        data: custom_vlr_data.clone(),
+    });
+    builder.evlrs.push(las::Vlr {
+        user_id: "shape_test".to_string(),
+        record_id: 78,
+        description: "source extended metadata".to_string(),
+        data: custom_evlr_data.clone(),
+    });
+
+    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
+    for point in combined_metadata_shape_points() {
+        writer.write(point).unwrap();
+    }
+    writer.close().unwrap();
+
+    let mut source_reader = las::Reader::from_path(&las_path).unwrap();
+    let source_wkt = source_reader
+        .header()
+        .all_vlrs()
+        .find(|vlr| vlr.user_id == "LASF_Projection" && vlr.record_id == 2112)
+        .unwrap()
+        .data
+        .clone();
+    let source_custom_vlr = source_reader
+        .header()
+        .vlrs()
+        .iter()
+        .find(|vlr| vlr.user_id == "shape_test" && vlr.record_id == 77)
+        .unwrap()
+        .clone();
+    let source_points = source_reader
+        .points()
+        .collect::<las::Result<Vec<_>>>()
+        .unwrap();
+    let source_evlrs = read_las_evlrs(&las_path);
+    let source_custom_evlr = source_evlrs
+        .iter()
+        .find(|vlr| vlr.user_id == "shape_test" && vlr.record_id == 78)
+        .unwrap();
+
+    convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams {
+            max_points_per_node: 16,
+            max_depth: 4,
+        },
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap();
+
+    let mut copc_reader = CopcReader::open(std::fs::File::open(&copc_path).unwrap()).unwrap();
+    let copc_points = copc_reader
+        .points(LodSelection::All, BoundsSelection::All)
+        .unwrap()
+        .collect::<copc_core::Result<Vec<_>>>()
+        .unwrap();
+    assert_las_points_match_points(&source_points, &copc_points);
+
+    let header = read_las_header_prefix(&copc_path);
+    assert_eq!(16, header.global_encoding & 16);
+    assert_eq!(5, header.number_of_vlrs);
+    assert_eq!(2, header.number_of_evlrs);
+
+    let mut las_reader = las::Reader::from_path(&copc_path).unwrap();
+    assert_eq!(7, las_reader.header().point_format().to_u8().unwrap());
+    assert_eq!(3, las_reader.header().point_format().extra_bytes);
+    assert!(las_reader.header().has_wkt_crs());
+    let vlrs = las_reader.header().vlrs();
+    assert_eq!(5, vlrs.len());
+    assert_eq!("copc", vlrs[0].user_id);
+    assert_eq!(1, vlrs[0].record_id);
+    assert_eq!("laszip encoded", vlrs[1].user_id);
+    assert_eq!(22204, vlrs[1].record_id);
+    assert_eq!("LASF_Projection", vlrs[2].user_id);
+    assert_eq!(2112, vlrs[2].record_id);
+    assert_eq!(source_wkt.as_slice(), vlrs[2].data.as_slice());
+    assert_eq!("LASF_Spec", vlrs[3].user_id);
+    assert_eq!(4, vlrs[3].record_id);
+    assert_eq!(extra_descriptor.as_slice(), vlrs[3].data.as_slice());
+    assert_eq!(source_custom_vlr.user_id, vlrs[4].user_id);
+    assert_eq!(source_custom_vlr.record_id, vlrs[4].record_id);
+    assert_eq!(source_custom_vlr.description, vlrs[4].description);
+    assert_eq!(source_custom_vlr.data.as_slice(), vlrs[4].data.as_slice());
+
+    let las_points = las_reader
+        .points()
+        .collect::<las::Result<Vec<_>>>()
+        .unwrap();
+    assert_las_points_match_points(&source_points, &las_points);
+
+    let evlrs = read_las_evlrs(&copc_path);
+    assert_eq!(2, evlrs.len());
+    assert_eq!("copc", evlrs[0].user_id);
+    assert_eq!(1000, evlrs[0].record_id);
+    assert_eq!(source_custom_evlr.user_id, evlrs[1].user_id);
+    assert_eq!(source_custom_evlr.record_id, evlrs[1].record_id);
+    assert_eq!(source_custom_evlr.description, evlrs[1].description);
+    assert_eq!(source_custom_evlr.data.as_slice(), evlrs[1].data.as_slice());
+}
+
+#[test]
 fn streaming_conversion_rejects_geotiff_only_crs_with_specific_error() {
     let dir = tempfile::tempdir().unwrap();
     let las_path = dir.path().join("geotiff-crs.las");
@@ -1058,6 +1208,80 @@ fn extra_bytes_descriptor_vlr_data() -> Vec<u8> {
     data
 }
 
+fn combined_metadata_shape_points() -> Vec<Point> {
+    vec![
+        Point {
+            x: 500_000.12,
+            y: 4_100_000.34,
+            z: 101.56,
+            intensity: 101,
+            return_number: 1,
+            number_of_returns: 2,
+            scan_direction: ScanDirection::LeftToRight,
+            is_edge_of_flight_line: false,
+            classification: las::point::Classification::new(2).unwrap(),
+            is_synthetic: false,
+            is_key_point: true,
+            is_withheld: false,
+            is_overlap: false,
+            scanner_channel: 1,
+            scan_angle: -12.5,
+            user_data: 7,
+            point_source_id: 501,
+            gps_time: Some(1_700_000_001.25),
+            color: Some(Color::new(1000, 2000, 3000)),
+            extra_bytes: vec![0x01, 0xA2, 0xF0],
+            ..Default::default()
+        },
+        Point {
+            x: 500_010.12,
+            y: 4_100_010.34,
+            z: 111.56,
+            intensity: 202,
+            return_number: 2,
+            number_of_returns: 2,
+            scan_direction: ScanDirection::RightToLeft,
+            is_edge_of_flight_line: true,
+            classification: las::point::Classification::new(5).unwrap(),
+            is_synthetic: true,
+            is_key_point: false,
+            is_withheld: true,
+            is_overlap: true,
+            scanner_channel: 2,
+            scan_angle: 8.75,
+            user_data: 9,
+            point_source_id: 502,
+            gps_time: Some(1_700_000_002.5),
+            color: Some(Color::new(4000, 5000, 6000)),
+            extra_bytes: vec![0x02, 0xB3, 0xE1],
+            ..Default::default()
+        },
+        Point {
+            x: 500_020.12,
+            y: 4_100_020.34,
+            z: 121.56,
+            intensity: 303,
+            return_number: 1,
+            number_of_returns: 1,
+            scan_direction: ScanDirection::LeftToRight,
+            is_edge_of_flight_line: false,
+            classification: las::point::Classification::new(17).unwrap(),
+            is_synthetic: false,
+            is_key_point: false,
+            is_withheld: false,
+            is_overlap: false,
+            scanner_channel: 0,
+            scan_angle: 0.25,
+            user_data: 11,
+            point_source_id: 503,
+            gps_time: Some(1_700_000_003.75),
+            color: Some(Color::new(7000, 8000, 9000)),
+            extra_bytes: vec![0x03, 0xC4, 0xD2],
+            ..Default::default()
+        },
+    ]
+}
+
 fn source_bounds(points: &[CopcPointFields]) -> Bounds {
     points.iter().fold(
         Bounds::point(points[0].x, points[0].y, points[0].z),
@@ -1099,9 +1323,40 @@ fn assert_las_points_match_fields(expected: &[CopcPointFields], actual: &[Point]
             Some(Color::new(expected.red, expected.green, expected.blue)),
             actual.color
         );
-        assert!(actual.extra_bytes.is_empty());
+        assert_eq!(expected.extra_bytes, actual.extra_bytes);
         assert_eq!(None, actual.nir);
         assert_eq!(None, actual.waveform);
+    }
+}
+
+fn assert_las_points_match_points(expected: &[Point], actual: &[Point]) {
+    assert_eq!(expected.len(), actual.len());
+    for (expected, actual) in expected.iter().zip(actual) {
+        assert_eq!(expected.x, actual.x);
+        assert_eq!(expected.y, actual.y);
+        assert_eq!(expected.z, actual.z);
+        assert_eq!(expected.intensity, actual.intensity);
+        assert_eq!(expected.return_number, actual.return_number);
+        assert_eq!(expected.number_of_returns, actual.number_of_returns);
+        assert_eq!(expected.scan_direction, actual.scan_direction);
+        assert_eq!(
+            expected.is_edge_of_flight_line,
+            actual.is_edge_of_flight_line
+        );
+        assert_eq!(expected.classification, actual.classification);
+        assert_eq!(expected.is_synthetic, actual.is_synthetic);
+        assert_eq!(expected.is_key_point, actual.is_key_point);
+        assert_eq!(expected.is_withheld, actual.is_withheld);
+        assert_eq!(expected.is_overlap, actual.is_overlap);
+        assert_eq!(expected.scanner_channel, actual.scanner_channel);
+        assert_eq!(expected.scan_angle, actual.scan_angle);
+        assert_eq!(expected.user_data, actual.user_data);
+        assert_eq!(expected.point_source_id, actual.point_source_id);
+        assert_eq!(expected.gps_time, actual.gps_time);
+        assert_eq!(expected.color, actual.color);
+        assert_eq!(expected.extra_bytes, actual.extra_bytes);
+        assert_eq!(expected.nir, actual.nir);
+        assert_eq!(expected.waveform, actual.waveform);
     }
 }
 
