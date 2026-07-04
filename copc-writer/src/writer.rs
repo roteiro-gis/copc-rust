@@ -1006,7 +1006,7 @@ fn write_copc_from_spill(
     metadata: &OutputLasMetadata,
 ) -> Result<()> {
     cancel.check()?;
-    validate_streaming_layout_supported(&reader.layout())?;
+    validate_streaming_layout_supported(reader.layout())?;
     if reader.is_empty() {
         return Err(Error::InvalidInput(
             "cannot write empty cloud to COPC".into(),
