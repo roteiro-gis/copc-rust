@@ -2,7 +2,10 @@
 
 use std::io;
 
-use las::point::Format as LasFormat;
+use las::{point::Format as LasFormat, Header as LasHeader, Vlr};
+
+const LASF_SPEC_USER_ID: &str = "LASF_Spec";
+const EXTRA_BYTES_RECORD_ID: u16 = 4;
 
 /// In-memory representation of one full-fidelity LAS point.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +37,7 @@ pub struct LasPointRecord {
     pub byte_offset_to_waveform_data: u64,
     pub waveform_packet_size: u32,
     pub return_point_waveform_location: f32,
+    pub extra_bytes: Vec<u8>,
 }
 
 impl LasPointRecord {
@@ -87,18 +91,21 @@ impl LasPointRecord {
             byte_offset_to_waveform_data,
             waveform_packet_size,
             return_point_waveform_location,
+            extra_bytes: point.extra_bytes.clone(),
         }
     }
 }
 
 /// Records which optional dimensions are present in a streaming pass.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StreamingLayout {
     pub point_format: u8,
     pub has_gps: bool,
     pub has_color: bool,
     pub has_nir: bool,
     pub has_waveform: bool,
+    pub extra_bytes: u16,
+    pub extra_bytes_descriptors: Vec<Vlr>,
 }
 
 impl StreamingLayout {
@@ -109,7 +116,22 @@ impl StreamingLayout {
             has_color: format.has_color,
             has_nir: format.has_nir,
             has_waveform: format.has_waveform,
+            extra_bytes: format.extra_bytes,
+            extra_bytes_descriptors: Vec::new(),
         }
+    }
+
+    pub fn from_las_header(header: &LasHeader) -> Self {
+        let mut layout = Self::from_las_format(*header.point_format());
+        if layout.extra_bytes > 0 {
+            layout.extra_bytes_descriptors = header
+                .vlrs()
+                .iter()
+                .filter(|vlr| is_extra_bytes_descriptor_vlr(vlr))
+                .cloned()
+                .collect();
+        }
+        layout
     }
 
     /// Compute the spill width in bytes per record.
@@ -127,11 +149,12 @@ impl StreamingLayout {
         if self.has_waveform {
             width += WAVEFORM_BYTES;
         }
+        width += self.extra_bytes as usize;
         width
     }
 
     pub const fn max_record_width() -> usize {
-        ALWAYS_BYTES + GPS_BYTES + COLOR_BYTES + NIR_BYTES + WAVEFORM_BYTES
+        ALWAYS_BYTES + GPS_BYTES + COLOR_BYTES + NIR_BYTES + WAVEFORM_BYTES + u16::MAX as usize
     }
 }
 
@@ -141,9 +164,36 @@ const COLOR_BYTES: usize = 6;
 const NIR_BYTES: usize = 2;
 const WAVEFORM_BYTES: usize = 1 + 8 + 4 + 4;
 
+fn is_extra_bytes_descriptor_vlr(vlr: &Vlr) -> bool {
+    vlr.user_id == LASF_SPEC_USER_ID && vlr.record_id == EXTRA_BYTES_RECORD_ID
+}
+
 /// Serialize one record into `dst` using the fixed little-endian spill format.
-pub fn serialize_le(record: &LasPointRecord, layout: &StreamingLayout, dst: &mut [u8]) {
-    debug_assert_eq!(dst.len(), layout.record_width());
+pub fn serialize_le(
+    record: &LasPointRecord,
+    layout: &StreamingLayout,
+    dst: &mut [u8],
+) -> io::Result<()> {
+    if dst.len() != layout.record_width() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "destination is {} bytes, expected {}",
+                dst.len(),
+                layout.record_width()
+            ),
+        ));
+    }
+    let expected_extra_bytes = usize::from(layout.extra_bytes);
+    if record.extra_bytes.len() != expected_extra_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "record has {} extra byte(s), expected {expected_extra_bytes}",
+                record.extra_bytes.len()
+            ),
+        ));
+    }
     let mut offset = 0;
 
     write_f64(&mut offset, dst, record.x);
@@ -181,7 +231,10 @@ pub fn serialize_le(record: &LasPointRecord, layout: &StreamingLayout, dst: &mut
         write_u32(&mut offset, dst, record.waveform_packet_size);
         write_f32(&mut offset, dst, record.return_point_waveform_location);
     }
+    dst[offset..offset + expected_extra_bytes].copy_from_slice(&record.extra_bytes);
+    offset += expected_extra_bytes;
     debug_assert_eq!(offset, layout.record_width());
+    Ok(())
 }
 
 /// Deserialize one record from the little-endian spill bytes.
@@ -248,6 +301,14 @@ pub fn deserialize_le(src: &[u8], layout: &StreamingLayout) -> io::Result<LasPoi
     } else {
         (0, 0, 0, 0.0)
     };
+    let extra_bytes = if layout.extra_bytes > 0 {
+        let end = offset + usize::from(layout.extra_bytes);
+        let extra_bytes = src[offset..end].to_vec();
+        offset = end;
+        extra_bytes
+    } else {
+        Vec::new()
+    };
     debug_assert_eq!(offset, layout.record_width());
     Ok(LasPointRecord {
         x,
@@ -276,6 +337,7 @@ pub fn deserialize_le(src: &[u8], layout: &StreamingLayout) -> io::Result<LasPoi
         byte_offset_to_waveform_data,
         waveform_packet_size,
         return_point_waveform_location,
+        extra_bytes,
     })
 }
 
@@ -389,6 +451,7 @@ mod tests {
             byte_offset_to_waveform_data: 0xDEADBEEF,
             waveform_packet_size: 0xABCD,
             return_point_waveform_location: -42.5,
+            extra_bytes: vec![0xA0, 0xB1, 0xC2],
         }
     }
 
@@ -405,6 +468,8 @@ mod tests {
                             has_color,
                             has_nir,
                             has_waveform,
+                            extra_bytes: 3,
+                            extra_bytes_descriptors: Vec::new(),
                         };
                         let mut record = template.clone();
                         if !layout.has_gps {
@@ -425,7 +490,7 @@ mod tests {
                             record.return_point_waveform_location = 0.0;
                         }
                         let mut bytes = vec![0u8; layout.record_width()];
-                        serialize_le(&record, &layout, &mut bytes);
+                        serialize_le(&record, &layout, &mut bytes).unwrap();
                         assert_eq!(deserialize_le(&bytes, &layout).unwrap(), record);
                     }
                 }
@@ -452,17 +517,22 @@ mod tests {
         assert!(!layout0.has_color);
         assert!(!layout0.has_nir);
         assert!(!layout0.has_waveform);
+        assert_eq!(0, layout0.extra_bytes);
 
         let layout3 = StreamingLayout::from_las_format(LasFormat::new(3).unwrap());
         assert!(layout3.has_gps);
         assert!(layout3.has_color);
         assert!(!layout3.has_nir);
         assert!(!layout3.has_waveform);
+        assert_eq!(0, layout3.extra_bytes);
 
-        let layout10 = StreamingLayout::from_las_format(LasFormat::new(10).unwrap());
+        let mut format10 = LasFormat::new(10).unwrap();
+        format10.extra_bytes = 7;
+        let layout10 = StreamingLayout::from_las_format(format10);
         assert!(layout10.has_gps);
         assert!(layout10.has_color);
         assert!(layout10.has_nir);
         assert!(layout10.has_waveform);
+        assert_eq!(7, layout10.extra_bytes);
     }
 }

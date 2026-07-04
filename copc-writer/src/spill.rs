@@ -47,7 +47,8 @@ impl SpillWriter {
     }
 
     pub fn push(&mut self, record: &LasPointRecord) -> Result<()> {
-        serialize_le(record, &self.layout, &mut self.scratch);
+        serialize_le(record, &self.layout, &mut self.scratch)
+            .map_err(|e| Error::InvalidInput(format!("encode spill record: {e}")))?;
         let writer = self
             .file
             .as_mut()
@@ -155,8 +156,8 @@ impl SpillReader {
         self.count == 0
     }
 
-    pub fn layout(&self) -> StreamingLayout {
-        self.layout
+    pub fn layout(&self) -> &StreamingLayout {
+        &self.layout
     }
 
     pub fn bounds(&self) -> Bounds {
@@ -202,6 +203,8 @@ mod tests {
             has_color: true,
             has_nir: false,
             has_waveform: false,
+            extra_bytes: 2,
+            extra_bytes_descriptors: Vec::new(),
         }
     }
 
@@ -234,6 +237,7 @@ mod tests {
             byte_offset_to_waveform_data: 0,
             waveform_packet_size: 0,
             return_point_waveform_location: 0.0,
+            extra_bytes: vec![(seed & 0xff) as u8, ((seed >> 8) & 0xff) as u8],
         }
     }
 

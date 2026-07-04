@@ -12,12 +12,12 @@ impl CopcPointSource for VecSource {
     }
 
     fn xyz(&self, index: usize) -> (f64, f64, f64) {
-        let point = self.points[index];
+        let point = &self.points[index];
         (point.x, point.y, point.z)
     }
 
     fn fields(&self, index: usize) -> copc_core::Result<CopcPointFields> {
-        Ok(self.points[index])
+        Ok(self.points[index].clone())
     }
 }
 
@@ -137,6 +137,7 @@ fn grid_points(count: usize) -> Vec<CopcPointFields> {
                 red: 0,
                 green: 0,
                 blue: 0,
+                extra_bytes: Vec::new(),
             }
         })
         .collect()
