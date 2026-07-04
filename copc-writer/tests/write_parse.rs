@@ -744,9 +744,10 @@ fn streaming_conversion_preserves_wkt_crs_evlr() {
 
     let reader = las::Reader::from_path(&copc_path).unwrap();
     assert!(reader.header().has_wkt_crs());
-    let crs_records: Vec<_> = reader
-        .header()
-        .evlrs()
+    let evlrs = read_las_evlrs(&copc_path);
+    assert_eq!("copc", evlrs[0].user_id);
+    assert_eq!(1000, evlrs[0].record_id);
+    let crs_records: Vec<_> = evlrs
         .iter()
         .filter(|vlr| vlr.user_id == "LASF_Projection" && vlr.record_id == 2112)
         .collect();
@@ -755,20 +756,28 @@ fn streaming_conversion_preserves_wkt_crs_evlr() {
 }
 
 #[test]
-fn streaming_conversion_rejects_non_crs_source_vlrs() {
+fn streaming_conversion_preserves_non_crs_vlrs_and_evlrs() {
     let dir = tempfile::tempdir().unwrap();
-    let las_path = dir.path().join("custom-vlr.las");
-    let copc_path = dir.path().join("custom-vlr.copc.laz");
+    let las_path = dir.path().join("custom-records.las");
+    let copc_path = dir.path().join("custom-records.copc.laz");
     let spill_dir = dir.path().join("spill");
     std::fs::create_dir(&spill_dir).unwrap();
 
+    let vlr_data = vec![1, 2, 3];
+    let evlr_data = vec![8, 9, 10, 11];
     let mut builder = las::Builder::from((1, 4));
     builder.point_format = las::point::Format::new(6).unwrap();
     builder.vlrs.push(las::Vlr {
         user_id: "example".to_string(),
         record_id: 42,
         description: "custom metadata".to_string(),
-        data: vec![1, 2, 3],
+        data: vlr_data.clone(),
+    });
+    builder.evlrs.push(las::Vlr {
+        user_id: "example".to_string(),
+        record_id: 43,
+        description: "custom extended".to_string(),
+        data: evlr_data.clone(),
     });
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
@@ -784,15 +793,35 @@ fn streaming_conversion_rejects_non_crs_source_vlrs() {
         .unwrap();
     writer.close().unwrap();
 
-    let err = convert_las_to_copc_streaming(
+    convert_las_to_copc_streaming(
         &las_path,
         &copc_path,
         &CopcWriterParams::default(),
         &spill_dir,
         &NeverCancel,
     )
-    .unwrap_err();
-    assert!(err.to_string().contains("VLR"));
+    .unwrap();
+
+    let header = read_las_header_prefix(&copc_path);
+    assert_eq!(3, header.number_of_vlrs);
+
+    let reader = las::Reader::from_path(&copc_path).unwrap();
+    let vlrs = reader.header().vlrs();
+    assert_eq!("copc", vlrs[0].user_id);
+    assert_eq!(1, vlrs[0].record_id);
+    assert_eq!("laszip encoded", vlrs[1].user_id);
+    assert_eq!(22204, vlrs[1].record_id);
+    assert_eq!("example", vlrs[2].user_id);
+    assert_eq!(42, vlrs[2].record_id);
+    assert_eq!(vlr_data.as_slice(), vlrs[2].data.as_slice());
+
+    let evlrs = read_las_evlrs(&copc_path);
+    assert_eq!(2, evlrs.len());
+    assert_eq!("copc", evlrs[0].user_id);
+    assert_eq!(1000, evlrs[0].record_id);
+    assert_eq!("example", evlrs[1].user_id);
+    assert_eq!(43, evlrs[1].record_id);
+    assert_eq!(evlr_data.as_slice(), evlrs[1].data.as_slice());
 }
 
 #[test]
@@ -939,6 +968,8 @@ struct LasHeaderPrefix {
     file_source_id: u16,
     global_encoding: u16,
     number_of_vlrs: u32,
+    offset_to_first_evlr: u64,
+    number_of_evlrs: u32,
     system_identifier: String,
     generating_software: String,
 }
@@ -960,14 +991,48 @@ fn read_las_header_prefix(path: &std::path::Path) -> LasHeaderPrefix {
     file.read_exact(&mut generating_software).unwrap();
     file.seek(SeekFrom::Start(100)).unwrap();
     let number_of_vlrs = file.read_u32::<LittleEndian>().unwrap();
+    file.seek(SeekFrom::Start(235)).unwrap();
+    let offset_to_first_evlr = file.read_u64::<LittleEndian>().unwrap();
+    let number_of_evlrs = file.read_u32::<LittleEndian>().unwrap();
 
     LasHeaderPrefix {
         file_source_id,
         global_encoding,
         number_of_vlrs,
+        offset_to_first_evlr,
+        number_of_evlrs,
         system_identifier: trim_nuls(&system_identifier),
         generating_software: trim_nuls(&generating_software),
     }
+}
+
+fn read_las_evlrs(path: &std::path::Path) -> Vec<las::Vlr> {
+    let header = read_las_header_prefix(path);
+    if header.offset_to_first_evlr == 0 || header.number_of_evlrs == 0 {
+        return Vec::new();
+    }
+    let mut file = std::fs::File::open(path).unwrap();
+    file.seek(SeekFrom::Start(header.offset_to_first_evlr))
+        .unwrap();
+    let mut evlrs = Vec::new();
+    for _ in 0..header.number_of_evlrs {
+        let _reserved = file.read_u16::<LittleEndian>().unwrap();
+        let mut user_id = [0u8; 16];
+        file.read_exact(&mut user_id).unwrap();
+        let record_id = file.read_u16::<LittleEndian>().unwrap();
+        let data_len = file.read_u64::<LittleEndian>().unwrap() as usize;
+        let mut description = [0u8; 32];
+        file.read_exact(&mut description).unwrap();
+        let mut data = vec![0u8; data_len];
+        file.read_exact(&mut data).unwrap();
+        evlrs.push(las::Vlr {
+            user_id: trim_nuls(&user_id),
+            record_id,
+            description: trim_nuls(&description),
+            data,
+        });
+    }
+    evlrs
 }
 
 fn read_extended_return_counts(path: &std::path::Path) -> [u64; 15] {
