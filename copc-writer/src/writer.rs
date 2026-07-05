@@ -897,10 +897,18 @@ fn wkt_override_crs_record(crs_wkt: &str) -> OutputCrsRecord {
             user_id: LASF_PROJECTION_USER_ID.to_string(),
             record_id: WKT_CRS_RECORD_ID,
             description: "OGC WKT CRS".to_string(),
-            data: crs_wkt.as_bytes().to_vec(),
+            data: null_terminated_wkt_bytes(crs_wkt),
         },
         is_extended: false,
     }
+}
+
+fn null_terminated_wkt_bytes(crs_wkt: &str) -> Vec<u8> {
+    let mut data = crs_wkt.as_bytes().to_vec();
+    if !data.ends_with(&[0]) {
+        data.push(0);
+    }
+    data
 }
 
 fn extract_pass_through_vlrs(header: &las::Header) -> Vec<las::Vlr> {

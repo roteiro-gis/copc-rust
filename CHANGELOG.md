@@ -7,6 +7,8 @@
 - add a proj-free CRS WKT override hook for LAS/LAZ-to-COPC streaming
   conversion, allowing downstream engines to resolve GeoTIFF-only CRS metadata
   externally and have `copc-writer` emit the resulting WKT CRS VLR
+- null-terminate caller-supplied WKT override CRS VLR payloads for stricter
+  LAS/COPC reader interoperability
 - keep GeoTIFF-only CRS inputs rejected with the specific unsupported
   conversion error when no WKT CRS record or WKT override is supplied
 
