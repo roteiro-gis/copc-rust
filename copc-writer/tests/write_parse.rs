@@ -1070,27 +1070,7 @@ fn streaming_conversion_rejects_geotiff_only_crs_with_specific_error() {
     let spill_dir = dir.path().join("spill");
     std::fs::create_dir(&spill_dir).unwrap();
 
-    let mut builder = las::Builder::from((1, 4));
-    builder.point_format = las::point::Format::new(6).unwrap();
-    builder.vlrs.push(las::Vlr {
-        user_id: "LASF_Projection".to_string(),
-        record_id: 34735,
-        description: "GeoTIFF GeoKeyDirectoryTag".to_string(),
-        data: vec![1, 1, 0, 0],
-    });
-    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
-    writer
-        .write(las::Point {
-            x: 1.0,
-            y: 2.0,
-            z: 3.0,
-            return_number: 1,
-            number_of_returns: 1,
-            gps_time: Some(1.0),
-            ..Default::default()
-        })
-        .unwrap();
-    writer.close().unwrap();
+    write_geotiff_only_crs_las(&las_path);
 
     let err = convert_las_to_copc_streaming(
         &las_path,
@@ -1114,27 +1094,7 @@ fn streaming_conversion_uses_crs_wkt_override_for_geotiff_only_crs() {
     std::fs::create_dir(&spill_dir).unwrap();
 
     let crs_wkt = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433],AUTHORITY[\"EPSG\",\"4326\"]]";
-    let mut builder = las::Builder::from((1, 4));
-    builder.point_format = las::point::Format::new(6).unwrap();
-    builder.vlrs.push(las::Vlr {
-        user_id: "LASF_Projection".to_string(),
-        record_id: 34735,
-        description: "GeoTIFF GeoKeyDirectoryTag".to_string(),
-        data: vec![1, 1, 0, 0],
-    });
-    let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
-    writer
-        .write(las::Point {
-            x: 1.0,
-            y: 2.0,
-            z: 3.0,
-            return_number: 1,
-            number_of_returns: 1,
-            gps_time: Some(1.0),
-            ..Default::default()
-        })
-        .unwrap();
-    writer.close().unwrap();
+    write_geotiff_only_crs_las(&las_path);
 
     convert_las_to_copc_streaming_with_crs_wkt_override(
         &las_path,
@@ -1158,11 +1118,36 @@ fn streaming_conversion_uses_crs_wkt_override_for_geotiff_only_crs() {
         .filter(|vlr| vlr.user_id == "LASF_Projection" && vlr.record_id == 2112)
         .collect();
     assert_eq!(1, crs_records.len());
-    assert_eq!(crs_wkt.as_bytes(), crs_records[0].data.as_slice());
+    let mut expected_wkt = crs_wkt.as_bytes().to_vec();
+    expected_wkt.push(0);
+    assert_eq!(expected_wkt.as_slice(), crs_records[0].data.as_slice());
     assert!(!reader
         .header()
         .all_vlrs()
         .any(|vlr| vlr.user_id == "LASF_Projection" && vlr.record_id == 34735));
+}
+
+#[test]
+fn streaming_conversion_rejects_empty_crs_wkt_override_for_geotiff_only_crs() {
+    let dir = tempfile::tempdir().unwrap();
+    let las_path = dir.path().join("geotiff-empty-crs-override.las");
+    let copc_path = dir.path().join("geotiff-empty-crs-override.copc.laz");
+    let spill_dir = dir.path().join("spill");
+    std::fs::create_dir(&spill_dir).unwrap();
+
+    write_geotiff_only_crs_las(&las_path);
+
+    let err = convert_las_to_copc_streaming_with_crs_wkt_override(
+        &las_path,
+        &copc_path,
+        &CopcWriterParams::default(),
+        &spill_dir,
+        &NeverCancel,
+        Some(""),
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("GeoTIFF-to-WKT CRS conversion"));
 }
 
 #[test]
@@ -1345,6 +1330,30 @@ fn read_extended_return_counts(path: &std::path::Path) -> [u64; 15] {
 
 fn wgs84_wkt_vlr_data() -> Vec<u8> {
     b"GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433],AUTHORITY[\"EPSG\",\"4326\"]]\0".to_vec()
+}
+
+fn write_geotiff_only_crs_las(path: &std::path::Path) {
+    let mut builder = las::Builder::from((1, 4));
+    builder.point_format = las::point::Format::new(6).unwrap();
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Projection".to_string(),
+        record_id: 34735,
+        description: "GeoTIFF GeoKeyDirectoryTag".to_string(),
+        data: vec![1, 1, 0, 0],
+    });
+    let mut writer = las::Writer::from_path(path, builder.into_header().unwrap()).unwrap();
+    writer
+        .write(las::Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            return_number: 1,
+            number_of_returns: 1,
+            gps_time: Some(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+    writer.close().unwrap();
 }
 
 fn extra_bytes_descriptor_vlr_data() -> Vec<u8> {
