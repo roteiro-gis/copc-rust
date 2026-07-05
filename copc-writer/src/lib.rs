@@ -5,7 +5,7 @@ mod writer;
 
 pub use spill::{SpillReader, SpillWriter};
 pub use writer::{
-    convert_las_to_copc_streaming, write_source, write_source_with_cancel,
-    write_streaming_with_cancel, ColumnBatchSource, CopcPointFields, CopcPointSource,
-    CopcWriterParams,
+    convert_las_to_copc_streaming, convert_las_to_copc_streaming_with_crs_wkt_override,
+    write_source, write_source_with_cancel, write_streaming_with_cancel, ColumnBatchSource,
+    CopcPointFields, CopcPointSource, CopcWriterParams,
 };

@@ -72,6 +72,10 @@ convert_las_to_copc_streaming(
 )?;
 ```
 
+For GeoTIFF-only CRS inputs, resolve CRS externally and call
+`convert_las_to_copc_streaming_with_crs_wkt_override` with `Some(wkt)`; the
+writer emits the supplied WKT CRS VLR without depending on a geodesy library.
+
 ## Column Ownership Model
 
 `copc-core` owns the LAS/COPC-native column model: `LasDimension`,
@@ -106,6 +110,8 @@ behind a future optional feature.
 - Streaming LAS/LAZ-to-COPC conversion through a disk-backed mmap spill
 - Streaming conversion preserves WKT CRS records, LAS Extra Bytes payloads and
   descriptors, and source non-CRS VLRs/EVLRs
+- Streaming conversion can accept caller-resolved WKT for GeoTIFF-only CRS
+  inputs without adding a geodesy dependency to `copc-writer`
 - LAS 1.4 point formats 6 and 7 with LAZ variable-size chunks
 - Interior-node representative points for native LOD reads
 
@@ -113,7 +119,7 @@ behind a future optional feature.
 
 - Zero-copy column views directly over compressed COPC/LAZ point data
 - Built-in Arrow or DataFusion conversion
-- GeoTIFF-only CRS conversion to WKT during LAS/LAZ-to-COPC conversion
+- Built-in GeoTIFF-only CRS conversion to WKT during LAS/LAZ-to-COPC conversion
 
 ## Testing
 

@@ -475,12 +475,21 @@ impl Default for OutputLasMetadata {
 }
 
 impl OutputLasMetadata {
-    fn from_las_header(header: &las::Header, source_evlrs: &[las::Vlr]) -> Self {
+    fn from_las_header(
+        header: &las::Header,
+        source_evlrs: &[las::Vlr],
+        crs_wkt_override: Option<&str>,
+    ) -> Self {
         let mut global_encoding = u16::from(header.gps_time_type());
         if header.has_synthetic_return_numbers() {
             global_encoding |= 8;
         }
-        let crs_records = extract_source_wkt_crs_records(header, source_evlrs);
+        let mut crs_records = extract_source_wkt_crs_records(header, source_evlrs);
+        if crs_records.is_empty() && has_geotiff_crs_record(header, source_evlrs) {
+            if let Some(crs_wkt) = normalized_crs_wkt_override(crs_wkt_override) {
+                crs_records.push(wkt_override_crs_record(crs_wkt));
+            }
+        }
         if !crs_records.is_empty() {
             global_encoding |= WKT_GLOBAL_ENCODING_BIT;
         }
@@ -679,13 +688,45 @@ pub fn convert_las_to_copc_streaming(
     spill_dir: &Path,
     cancel: &dyn CancelCheck,
 ) -> Result<()> {
+    convert_las_to_copc_streaming_inner(las_path, copc_path, params, spill_dir, cancel, None)
+}
+
+/// Converts LAS/LAZ to COPC and emits `crs_wkt_override` as a WKT CRS VLR
+/// when the source has GeoTIFF CRS records but no WKT CRS record.
+pub fn convert_las_to_copc_streaming_with_crs_wkt_override(
+    las_path: &Path,
+    copc_path: &Path,
+    params: &CopcWriterParams,
+    spill_dir: &Path,
+    cancel: &dyn CancelCheck,
+    crs_wkt_override: Option<&str>,
+) -> Result<()> {
+    convert_las_to_copc_streaming_inner(
+        las_path,
+        copc_path,
+        params,
+        spill_dir,
+        cancel,
+        crs_wkt_override,
+    )
+}
+
+fn convert_las_to_copc_streaming_inner(
+    las_path: &Path,
+    copc_path: &Path,
+    params: &CopcWriterParams,
+    spill_dir: &Path,
+    cancel: &dyn CancelCheck,
+    crs_wkt_override: Option<&str>,
+) -> Result<()> {
     cancel.check()?;
     let las_file = File::open(las_path).map_err(|e| Error::io("open source LAS/LAZ", e))?;
     let mut reader = las::Reader::new(BufReader::with_capacity(LAS_INPUT_BUFFER_BYTES, las_file))
         .map_err(|e| Error::Las(e.to_string()))?;
     let source_evlrs = read_all_source_evlrs(las_path)?;
-    validate_las_conversion_supported(reader.header(), &source_evlrs)?;
-    let output_metadata = OutputLasMetadata::from_las_header(reader.header(), &source_evlrs);
+    validate_las_conversion_supported(reader.header(), &source_evlrs, crs_wkt_override)?;
+    let output_metadata =
+        OutputLasMetadata::from_las_header(reader.header(), &source_evlrs, crs_wkt_override);
     let layout = StreamingLayout::from_las_header(reader.header());
     let mut spill = SpillWriter::create(spill_dir, layout)?;
     for (index, result) in reader.points().enumerate() {
@@ -745,6 +786,7 @@ fn validate_streaming_layout_supported(layout: &StreamingLayout) -> Result<()> {
 fn validate_las_conversion_supported(
     header: &las::Header,
     source_evlrs: &[las::Vlr],
+    crs_wkt_override: Option<&str>,
 ) -> Result<()> {
     let mut unsupported = Vec::new();
     let format = header.point_format();
@@ -755,14 +797,15 @@ fn validate_las_conversion_supported(
         unsupported.push("waveform point data".to_string());
     }
     let source_has_wkt_crs_record = has_wkt_crs_record(header, source_evlrs);
+    let has_crs_wkt_override = normalized_crs_wkt_override(crs_wkt_override).is_some();
     let mut geotiff_crs_record_count = 0usize;
     for vlr in header.vlrs() {
-        if is_geotiff_crs_vlr(vlr) && !source_has_wkt_crs_record {
+        if is_geotiff_crs_vlr(vlr) && !source_has_wkt_crs_record && !has_crs_wkt_override {
             geotiff_crs_record_count += 1;
         }
     }
     for evlr in source_evlrs {
-        if is_geotiff_crs_vlr(evlr) && !source_has_wkt_crs_record {
+        if is_geotiff_crs_vlr(evlr) && !source_has_wkt_crs_record && !has_crs_wkt_override {
             geotiff_crs_record_count += 1;
         }
     }
@@ -808,12 +851,20 @@ fn is_geotiff_crs_vlr(vlr: &las::Vlr) -> bool {
         )
 }
 
+fn normalized_crs_wkt_override(crs_wkt_override: Option<&str>) -> Option<&str> {
+    crs_wkt_override.filter(|crs_wkt| !crs_wkt.trim().is_empty())
+}
+
 fn is_extra_bytes_descriptor_vlr(vlr: &las::Vlr) -> bool {
     vlr.user_id == LASF_SPEC_USER_ID && vlr.record_id == EXTRA_BYTES_RECORD_ID
 }
 
 fn has_wkt_crs_record(header: &las::Header, source_evlrs: &[las::Vlr]) -> bool {
     header.vlrs().iter().any(is_wkt_crs_vlr) || source_evlrs.iter().any(is_wkt_crs_vlr)
+}
+
+fn has_geotiff_crs_record(header: &las::Header, source_evlrs: &[las::Vlr]) -> bool {
+    header.vlrs().iter().any(is_geotiff_crs_vlr) || source_evlrs.iter().any(is_geotiff_crs_vlr)
 }
 
 fn extract_source_wkt_crs_records(
@@ -838,6 +889,18 @@ fn extract_source_wkt_crs_records(
         }
     }
     records
+}
+
+fn wkt_override_crs_record(crs_wkt: &str) -> OutputCrsRecord {
+    OutputCrsRecord {
+        vlr: las::Vlr {
+            user_id: LASF_PROJECTION_USER_ID.to_string(),
+            record_id: WKT_CRS_RECORD_ID,
+            description: "OGC WKT CRS".to_string(),
+            data: crs_wkt.as_bytes().to_vec(),
+        },
+        is_extended: false,
+    }
 }
 
 fn extract_pass_through_vlrs(header: &las::Header) -> Vec<las::Vlr> {
