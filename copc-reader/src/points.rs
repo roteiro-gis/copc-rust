@@ -3,8 +3,8 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use copc_core::{
-    layout_for_las_format, scan_angle_rank_from_degrees, Bounds, CancelCheck, ColumnData,
-    ColumnSelection, ColumnSpec, CopcInfo, Entry, Error, LasColumnBatch, LasDimension, Result,
+    layout_for_las_format, Bounds, CancelCheck, ColumnData, ColumnSelection, ColumnSpec, CopcInfo,
+    Entry, Error, LasColumnBatch, LasDimension, Result,
 };
 use las::point::Format as LasPointFormat;
 use las::{Point, Transform, Vector};
@@ -276,7 +276,7 @@ fn append_columns(
         flags.scan_direction(),
         las::point::ScanDirection::LeftToRight
     );
-    let scan_angle_rank = scan_angle_rank_from_degrees(f32::from(raw_point.scan_angle));
+    let scan_angle = f32::from(raw_point.scan_angle);
     let context = ColumnAppendContext {
         raw_point,
         xyz,
@@ -284,7 +284,7 @@ fn append_columns(
         classification,
         is_overlap,
         scan_direction_flag,
-        scan_angle_rank,
+        scan_angle,
     };
 
     for (spec, data) in columns {
@@ -300,7 +300,7 @@ struct ColumnAppendContext<'a> {
     classification: u8,
     is_overlap: bool,
     scan_direction_flag: bool,
-    scan_angle_rank: i16,
+    scan_angle: f32,
 }
 
 fn append_column(
@@ -332,8 +332,8 @@ fn append_column(
         (LasDimension::EdgeOfFlightLine, ColumnData::Bool(values)) => {
             values.push(context.flags.is_edge_of_flight_line());
         }
-        (LasDimension::ScanAngleRank, ColumnData::I16(values)) => {
-            values.push(context.scan_angle_rank);
+        (LasDimension::ScanAngle, ColumnData::F32(values)) => {
+            values.push(context.scan_angle);
         }
         (LasDimension::UserData, ColumnData::U8(values)) => {
             values.push(context.raw_point.user_data);

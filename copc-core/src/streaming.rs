@@ -8,7 +8,7 @@ const LASF_SPEC_USER_ID: &str = "LASF_Spec";
 const EXTRA_BYTES_RECORD_ID: u16 = 4;
 
 /// In-memory representation of one full-fidelity LAS point.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LasPointRecord {
     pub x: f64,
     pub y: f64,
@@ -239,6 +239,17 @@ pub fn serialize_le(
 
 /// Deserialize one record from the little-endian spill bytes.
 pub fn deserialize_le(src: &[u8], layout: &StreamingLayout) -> io::Result<LasPointRecord> {
+    let mut record = LasPointRecord::default();
+    deserialize_le_into(src, layout, &mut record)?;
+    Ok(record)
+}
+
+/// Deserialize one record into `out`, reusing its `extra_bytes` allocation.
+pub fn deserialize_le_into(
+    src: &[u8],
+    layout: &StreamingLayout,
+    out: &mut LasPointRecord,
+) -> io::Result<()> {
     if src.len() != layout.record_width() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -301,44 +312,40 @@ pub fn deserialize_le(src: &[u8], layout: &StreamingLayout) -> io::Result<LasPoi
     } else {
         (0, 0, 0, 0.0)
     };
-    let extra_bytes = if layout.extra_bytes > 0 {
+    out.extra_bytes.clear();
+    if layout.extra_bytes > 0 {
         let end = offset + usize::from(layout.extra_bytes);
-        let extra_bytes = src[offset..end].to_vec();
+        out.extra_bytes.extend_from_slice(&src[offset..end]);
         offset = end;
-        extra_bytes
-    } else {
-        Vec::new()
-    };
+    }
     debug_assert_eq!(offset, layout.record_width());
-    Ok(LasPointRecord {
-        x,
-        y,
-        z,
-        intensity,
-        return_number,
-        number_of_returns,
-        classification,
-        scan_direction_flag,
-        edge_of_flight_line,
-        scan_angle,
-        user_data,
-        point_source_id,
-        synthetic,
-        key_point,
-        withheld,
-        overlap,
-        scan_channel,
-        gps_time,
-        red,
-        green,
-        blue,
-        nir,
-        wave_packet_descriptor_index,
-        byte_offset_to_waveform_data,
-        waveform_packet_size,
-        return_point_waveform_location,
-        extra_bytes,
-    })
+    out.x = x;
+    out.y = y;
+    out.z = z;
+    out.intensity = intensity;
+    out.return_number = return_number;
+    out.number_of_returns = number_of_returns;
+    out.classification = classification;
+    out.scan_direction_flag = scan_direction_flag;
+    out.edge_of_flight_line = edge_of_flight_line;
+    out.scan_angle = scan_angle;
+    out.user_data = user_data;
+    out.point_source_id = point_source_id;
+    out.synthetic = synthetic;
+    out.key_point = key_point;
+    out.withheld = withheld;
+    out.overlap = overlap;
+    out.scan_channel = scan_channel;
+    out.gps_time = gps_time;
+    out.red = red;
+    out.green = green;
+    out.blue = blue;
+    out.nir = nir;
+    out.wave_packet_descriptor_index = wave_packet_descriptor_index;
+    out.byte_offset_to_waveform_data = byte_offset_to_waveform_data;
+    out.waveform_packet_size = waveform_packet_size;
+    out.return_point_waveform_location = return_point_waveform_location;
+    Ok(())
 }
 
 #[inline]
