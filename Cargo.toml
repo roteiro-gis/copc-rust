@@ -1,5 +1,6 @@
 [workspace]
 members = ["copc-core", "copc-reader", "copc-writer"]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
