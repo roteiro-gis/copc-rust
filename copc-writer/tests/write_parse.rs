@@ -3,7 +3,8 @@ use copc_core::{Bounds, NeverCancel, StreamingLayout};
 use copc_reader::{BoundsSelection, CopcFile, CopcReader, LodSelection};
 use copc_writer::{
     convert_las_to_copc_streaming, convert_las_to_copc_streaming_with_crs_wkt_override,
-    write_source, write_streaming_with_cancel, CopcPointFields, CopcPointSource, CopcWriterParams,
+    write_source, write_streaming_with_cancel, CopcPointFields, CopcPointSource, CopcWriteMetadata,
+    CopcWriterParams,
 };
 use las::point::ScanDirection;
 use las::{Color, Point};
@@ -26,8 +27,9 @@ impl CopcPointSource for VecSource {
         (p.x, p.y, p.z)
     }
 
-    fn fields(&self, index: usize) -> copc_core::Result<CopcPointFields> {
-        Ok(self.points[index].clone())
+    fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {
+        out.clone_from(&self.points[index]);
+        Ok(())
     }
 }
 
@@ -76,10 +78,8 @@ fn writer_output_parses_with_reader_hierarchy() {
         &source,
         false,
         bounds,
-        &CopcWriterParams {
-            max_points_per_node: 128,
-            max_depth: 6,
-        },
+        &CopcWriterParams::new(128),
+        &CopcWriteMetadata::default(),
     )
     .unwrap();
 
@@ -190,11 +190,21 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fields.copc.laz");
 
-    write_source(&path, &source, true, bounds, &CopcWriterParams::default()).unwrap();
+    write_source(
+        &path,
+        &source,
+        true,
+        bounds,
+        &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
+    )
+    .unwrap();
 
     let header = read_las_header_prefix(&path);
-    assert_eq!(0, header.global_encoding);
-    assert_eq!(2, header.number_of_vlrs);
+    // PDRF 6/7 output always sets the WKT global-encoding bit, backed by an
+    // (empty) WKT CRS VLR alongside the COPC info and LASzip VLRs.
+    assert_eq!(16, header.global_encoding);
+    assert_eq!(3, header.number_of_vlrs);
 
     let mut copc_reader = CopcReader::open(std::fs::File::open(&path).unwrap()).unwrap();
     let copc_points = copc_reader
@@ -243,7 +253,15 @@ fn writer_emits_gps_time_range_and_return_histogram() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("point-stats.copc.laz");
 
-    write_source(&path, &source, false, bounds, &CopcWriterParams::default()).unwrap();
+    write_source(
+        &path,
+        &source,
+        false,
+        bounds,
+        &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
+    )
+    .unwrap();
 
     let file = CopcFile::open(&path).unwrap();
     assert_eq!(75.0, file.copc_info().gpstime_min);
@@ -254,6 +272,31 @@ fn writer_emits_gps_time_range_and_return_histogram() {
     assert_eq!(2, return_counts[1]);
     assert_eq!(1, return_counts[14]);
     assert_eq!(4, return_counts.iter().sum::<u64>());
+}
+
+#[test]
+fn writer_rejects_point_outside_declared_bounds() {
+    let source = VecSource {
+        points: vec![point_fields(1.0, 1.0, 1.0), point_fields(10.0, 10.0, 10.0)],
+    };
+    let bounds = Bounds::new((0.0, 0.0, 0.0), (5.0, 5.0, 5.0));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out-of-bounds.copc.laz");
+
+    let err = write_source(
+        &path,
+        &source,
+        false,
+        bounds,
+        &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("outside the declared bounds"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -270,6 +313,7 @@ fn writer_rejects_non_finite_bounds() {
         false,
         Bounds::new((0.0, 0.0, 0.0), (f64::INFINITY, 0.0, 0.0)),
         &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
     )
     .unwrap_err();
 
@@ -291,6 +335,7 @@ fn writer_rejects_non_finite_source_coordinate() {
         false,
         Bounds::point(0.0, 0.0, 0.0),
         &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
     )
     .unwrap_err();
 
@@ -316,6 +361,7 @@ fn writer_rejects_non_finite_gps_time() {
         false,
         Bounds::point(0.0, 0.0, 0.0),
         &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
     )
     .unwrap_err();
 
@@ -365,6 +411,7 @@ fn writer_rejects_out_of_range_point_flag_fields() {
             false,
             Bounds::point(0.0, 0.0, 0.0),
             &CopcWriterParams::default(),
+            &CopcWriteMetadata::default(),
         )
         .unwrap_err();
 
@@ -393,6 +440,7 @@ fn writer_rejects_coordinate_outside_las_i32_range() {
         false,
         Bounds::new((0.0, 0.0, 0.0), (5_000_000.0, 0.0, 0.0)),
         &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
     )
     .unwrap_err();
 
@@ -428,10 +476,7 @@ fn streaming_conversion_preserves_fractional_scan_angle_degrees() {
     convert_las_to_copc_streaming(
         &las_path,
         &copc_path,
-        &CopcWriterParams {
-            max_points_per_node: 128,
-            max_depth: 4,
-        },
+        &CopcWriterParams::new(128),
         &spill_dir,
         &NeverCancel,
     )
@@ -488,8 +533,8 @@ fn streaming_conversion_preserves_supported_header_metadata() {
 
     let header = read_las_header_prefix(&copc_path);
     assert_eq!(42, header.file_source_id);
-    assert_eq!(9, header.global_encoding);
-    assert_eq!(2, header.number_of_vlrs);
+    assert_eq!(9 | 16, header.global_encoding);
+    assert_eq!(3, header.number_of_vlrs);
     assert_eq!("source-system", header.system_identifier);
     assert_eq!("source-software", header.generating_software);
 }
@@ -539,7 +584,7 @@ fn streaming_conversion_preserves_extra_point_bytes_and_descriptor() {
     .unwrap();
 
     let header = read_las_header_prefix(&copc_path);
-    assert_eq!(3, header.number_of_vlrs);
+    assert_eq!(4, header.number_of_vlrs);
 
     let mut reader = las::Reader::from_path(&copc_path).unwrap();
     assert_eq!(6, reader.header().point_format().to_u8().unwrap());
@@ -803,7 +848,7 @@ fn streaming_conversion_preserves_non_crs_vlrs_and_evlrs() {
     .unwrap();
 
     let header = read_las_header_prefix(&copc_path);
-    assert_eq!(3, header.number_of_vlrs);
+    assert_eq!(4, header.number_of_vlrs);
 
     let reader = las::Reader::from_path(&copc_path).unwrap();
     let vlrs = reader.header().vlrs();
@@ -811,9 +856,12 @@ fn streaming_conversion_preserves_non_crs_vlrs_and_evlrs() {
     assert_eq!(1, vlrs[0].record_id);
     assert_eq!("laszip encoded", vlrs[1].user_id);
     assert_eq!(22204, vlrs[1].record_id);
-    assert_eq!("example", vlrs[2].user_id);
-    assert_eq!(42, vlrs[2].record_id);
-    assert_eq!(vlr_data.as_slice(), vlrs[2].data.as_slice());
+    assert_eq!("LASF_Projection", vlrs[2].user_id);
+    assert_eq!(2112, vlrs[2].record_id);
+    assert_eq!(&[0u8], vlrs[2].data.as_slice());
+    assert_eq!("example", vlrs[3].user_id);
+    assert_eq!(42, vlrs[3].record_id);
+    assert_eq!(vlr_data.as_slice(), vlrs[3].data.as_slice());
 
     let evlrs = read_las_evlrs(&copc_path);
     assert_eq!(2, evlrs.len());
@@ -869,10 +917,7 @@ fn streaming_conversion_preserves_combined_extra_bytes_metadata_and_crs() {
     convert_las_to_copc_streaming(
         &las_path,
         &copc_path,
-        &CopcWriterParams {
-            max_points_per_node: 16,
-            max_depth: 4,
-        },
+        &CopcWriterParams::new(16),
         &spill_dir,
         &NeverCancel,
     )
@@ -943,10 +988,7 @@ fn streaming_conversion_preserves_combined_shape_from_copc_laz_input() {
     std::fs::create_dir(&second_spill_dir).unwrap();
 
     write_combined_metadata_shape_las(&las_path);
-    let params = CopcWriterParams {
-        max_points_per_node: 16,
-        max_depth: 4,
-    };
+    let params = CopcWriterParams::new(16);
     convert_las_to_copc_streaming(
         &las_path,
         &source_copc_path,
@@ -1205,6 +1247,7 @@ fn streaming_writer_rejects_unsupported_layout_dimensions() {
         layout,
         std::iter::empty::<copc_core::Result<copc_core::LasPointRecord>>(),
         &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
         &spill_dir,
         &NeverCancel,
     )
@@ -1236,6 +1279,7 @@ fn streaming_writer_rejects_non_finite_record_coordinate() {
         layout,
         vec![Ok(las_record(f64::INFINITY, 0.0, 0.0))],
         &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
         &spill_dir,
         &NeverCancel,
     )

@@ -93,6 +93,7 @@ dependencies = [
  "las",
  "laz 0.8.3",
  "memmap2",
+ "rayon",
  "tempfile",
 ]
 

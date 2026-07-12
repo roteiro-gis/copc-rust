@@ -1,6 +1,8 @@
 use copc_core::Bounds;
 use copc_reader::{BoundsSelection, CopcFile, CopcReader, LodSelection};
-use copc_writer::{write_source, CopcPointFields, CopcPointSource, CopcWriterParams};
+use copc_writer::{
+    write_source, CopcPointFields, CopcPointSource, CopcWriteMetadata, CopcWriterParams,
+};
 
 struct VecSource {
     points: Vec<CopcPointFields>,
@@ -16,8 +18,9 @@ impl CopcPointSource for VecSource {
         (point.x, point.y, point.z)
     }
 
-    fn fields(&self, index: usize) -> copc_core::Result<CopcPointFields> {
-        Ok(self.points[index].clone())
+    fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {
+        out.clone_from(&self.points[index]);
+        Ok(())
     }
 }
 
@@ -35,10 +38,8 @@ fn reader_lod_resolution_bounds_and_size_hints_match_hierarchy() {
         &source,
         false,
         bounds,
-        &CopcWriterParams {
-            max_points_per_node: 96,
-            max_depth: 8,
-        },
+        &CopcWriterParams::new(96),
+        &CopcWriteMetadata::default(),
     )
     .unwrap();
 
