@@ -15,7 +15,7 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt};
 use copc_core::{
     CopcInfo, Entry, EntryAvailability, Error, HierarchyPage, Result, VoxelKey,
-    HIERARCHY_ENTRY_BYTES,
+    HIERARCHY_ENTRY_BYTES, MAX_EVLR_COUNT, MAX_VLR_COUNT,
 };
 use las::{Transform, Vector};
 use laz::LazVlr;
@@ -28,8 +28,6 @@ pub use points::{BoundsSelection, CopcReader, LodSelection, PointIter, PointQuer
 const LAS_HEADER_SIZE_14: u16 = 375;
 const VLR_HEADER_BYTES: u64 = 54;
 const EVLR_HEADER_BYTES: u64 = 60;
-const MAX_VLR_COUNT: u32 = 4_096;
-const MAX_EVLR_COUNT: u32 = 4_096;
 const MAX_HIERARCHY_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HIERARCHY_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -96,19 +94,7 @@ impl CopcFile {
             file_len,
             u64::from(header.offset_to_point_data),
         )?;
-        let copc_info_vlr = vlrs
-            .iter()
-            .find(|vlr| vlr.user_id == "copc" && vlr.record_id == 1)
-            .ok_or_else(|| Error::InvalidData("missing COPC info VLR".into()))?;
-        let copc_info = CopcInfo::from_le_bytes(&copc_info_vlr.data)?;
-        let laszip_vlr = vlrs
-            .iter()
-            .find(|vlr| vlr.user_id == "laszip encoded" && vlr.record_id == 22204)
-            .map(|vlr| {
-                LazVlr::read_from(vlr.data.as_slice()).map_err(|e| Error::Las(e.to_string()))
-            })
-            .transpose()?
-            .ok_or_else(|| Error::InvalidData("missing LASzip VLR".into()))?;
+        let (copc_info, laszip_vlr) = extract_required_vlrs(&vlrs)?;
         let evlrs = read_evlr_refs(reader, &header, file_len)?;
         let root_evlr = evlrs
             .iter()
@@ -132,7 +118,7 @@ impl CopcFile {
         let mut hierarchy = BTreeMap::new();
         let mut visited_pages = HashSet::new();
         visited_pages.insert((copc_info.root_hier_offset, copc_info.root_hier_size));
-        insert_hierarchy_page(
+        insert_hierarchy_pages(
             reader,
             &root_hierarchy,
             &mut hierarchy,
@@ -140,6 +126,7 @@ impl CopcFile {
             file_len,
             &mut hierarchy_limits,
         )?;
+        validate_hierarchy_point_total(&hierarchy, header.number_of_points)?;
         Ok(Self {
             header,
             copc_info,
@@ -180,35 +167,42 @@ impl CopcFile {
     }
 
     pub(crate) fn point_format(&self) -> Result<las::point::Format> {
-        let format_id = self.header.point_data_record_format & 0x7F;
-        let mut format =
-            las::point::Format::new(format_id).map_err(|e| Error::Las(e.to_string()))?;
-        let base_len = format.len();
-        if self.header.point_data_record_length < base_len {
-            return Err(Error::InvalidData(format!(
-                "point record length {} is smaller than point format {} base length {}",
-                self.header.point_data_record_length, format_id, base_len
-            )));
-        }
-        format.extra_bytes = self.header.point_data_record_length - base_len;
-        Ok(format)
+        point_format_for(&self.header)
     }
 
     pub(crate) fn transforms(&self) -> Vector<Transform> {
-        Vector {
-            x: Transform {
-                scale: self.header.x_scale_factor,
-                offset: self.header.x_offset,
-            },
-            y: Transform {
-                scale: self.header.y_scale_factor,
-                offset: self.header.y_offset,
-            },
-            z: Transform {
-                scale: self.header.z_scale_factor,
-                offset: self.header.z_offset,
-            },
-        }
+        transforms_for(&self.header)
+    }
+}
+
+pub(crate) fn point_format_for(header: &LasHeader) -> Result<las::point::Format> {
+    let format_id = header.point_data_record_format & 0x7F;
+    let mut format = las::point::Format::new(format_id).map_err(|e| Error::Las(e.to_string()))?;
+    let base_len = format.len();
+    if header.point_data_record_length < base_len {
+        return Err(Error::InvalidData(format!(
+            "point record length {} is smaller than point format {} base length {}",
+            header.point_data_record_length, format_id, base_len
+        )));
+    }
+    format.extra_bytes = header.point_data_record_length - base_len;
+    Ok(format)
+}
+
+pub(crate) fn transforms_for(header: &LasHeader) -> Vector<Transform> {
+    Vector {
+        x: Transform {
+            scale: header.x_scale_factor,
+            offset: header.x_offset,
+        },
+        y: Transform {
+            scale: header.y_scale_factor,
+            offset: header.y_offset,
+        },
+        z: Transform {
+            scale: header.z_scale_factor,
+            offset: header.z_offset,
+        },
     }
 }
 
@@ -219,12 +213,12 @@ impl LasHeader {
 }
 
 #[derive(Debug, Default)]
-struct HierarchyReadLimits {
+pub(crate) struct HierarchyReadLimits {
     total_bytes: u64,
 }
 
 impl HierarchyReadLimits {
-    fn add_page(&mut self, byte_size: u64) -> Result<()> {
+    pub(crate) fn add_page(&mut self, byte_size: u64) -> Result<()> {
         if byte_size > MAX_HIERARCHY_PAGE_BYTES {
             return Err(Error::InvalidData(format!(
                 "hierarchy page is {byte_size} bytes, max supported is {MAX_HIERARCHY_PAGE_BYTES}"
@@ -242,6 +236,22 @@ impl HierarchyReadLimits {
         }
         Ok(())
     }
+}
+
+/// Extracts the COPC info and LASzip VLRs every COPC file must carry.
+pub(crate) fn extract_required_vlrs(vlrs: &[Vlr]) -> Result<(CopcInfo, LazVlr)> {
+    let copc_info_vlr = vlrs
+        .iter()
+        .find(|vlr| vlr.user_id == "copc" && vlr.record_id == 1)
+        .ok_or_else(|| Error::InvalidData("missing COPC info VLR".into()))?;
+    let copc_info = CopcInfo::from_le_bytes(&copc_info_vlr.data)?;
+    let laszip_vlr = vlrs
+        .iter()
+        .find(|vlr| vlr.user_id == "laszip encoded" && vlr.record_id == 22204)
+        .map(|vlr| LazVlr::read_from(vlr.data.as_slice()).map_err(|e| Error::Las(e.to_string())))
+        .transpose()?
+        .ok_or_else(|| Error::InvalidData("missing LASzip VLR".into()))?;
+    Ok((copc_info, laszip_vlr))
 }
 
 fn reader_len<R: Seek>(reader: &mut R) -> Result<u64> {
@@ -302,13 +312,32 @@ fn read_hierarchy_page_at<R: Read + Seek>(
     HierarchyPage::from_le_bytes(&hierarchy_bytes)
 }
 
-fn insert_hierarchy_page<R: Read + Seek>(
+/// Loads the full hierarchy tree with an explicit worklist rather than
+/// recursion, so a crafted file with a long chain of child pages cannot
+/// overflow the stack.
+fn insert_hierarchy_pages<R: Read + Seek>(
     reader: &mut R,
-    page: &HierarchyPage,
+    root_page: &HierarchyPage,
     hierarchy: &mut BTreeMap<VoxelKey, Entry>,
     visited_pages: &mut HashSet<(u64, u64)>,
     file_len: u64,
     limits: &mut HierarchyReadLimits,
+) -> Result<()> {
+    let mut pending = Vec::new();
+    queue_hierarchy_page(root_page, hierarchy, visited_pages, &mut pending, file_len)?;
+    while let Some((offset, byte_size)) = pending.pop() {
+        let page = read_hierarchy_page_at(reader, offset, byte_size, file_len, limits)?;
+        queue_hierarchy_page(&page, hierarchy, visited_pages, &mut pending, file_len)?;
+    }
+    Ok(())
+}
+
+fn queue_hierarchy_page(
+    page: &HierarchyPage,
+    hierarchy: &mut BTreeMap<VoxelKey, Entry>,
+    visited_pages: &mut HashSet<(u64, u64)>,
+    pending: &mut Vec<(u64, u64)>,
+    file_len: u64,
 ) -> Result<()> {
     for entry in page.entries().iter().copied() {
         validate_hierarchy_entry(entry, file_len)?;
@@ -317,17 +346,31 @@ fn insert_hierarchy_page<R: Read + Seek>(
     for entry in page.entries().iter().copied().filter(|e| e.is_child_page()) {
         let byte_size = u64::try_from(entry.byte_size).expect("validated child page byte size");
         if visited_pages.insert((entry.offset, byte_size)) {
-            let child_page =
-                read_hierarchy_page_at(reader, entry.offset, byte_size, file_len, limits)?;
-            insert_hierarchy_page(
-                reader,
-                &child_page,
-                hierarchy,
-                visited_pages,
-                file_len,
-                limits,
-            )?;
+            pending.push((entry.offset, byte_size));
         }
+    }
+    Ok(())
+}
+
+/// Rejects hierarchies whose claimed point totals exceed the LAS header point
+/// count, so downstream pre-allocations sized from chunk point counts stay
+/// bounded by a value that is at least self-consistent.
+fn validate_hierarchy_point_total(
+    hierarchy: &BTreeMap<VoxelKey, Entry>,
+    number_of_points: u64,
+) -> Result<()> {
+    let mut total: u64 = 0;
+    for entry in hierarchy.values() {
+        if let EntryAvailability::PointData { point_count } = entry.availability()? {
+            total = total
+                .checked_add(u64::from(point_count))
+                .ok_or_else(|| Error::InvalidData("hierarchy point total overflows u64".into()))?;
+        }
+    }
+    if total > number_of_points {
+        return Err(Error::InvalidData(format!(
+            "hierarchy point total {total} exceeds LAS header point count {number_of_points}"
+        )));
     }
     Ok(())
 }
@@ -856,6 +899,40 @@ mod tests {
     }
 
     #[test]
+    fn deep_child_page_chain_loads_without_stack_overflow() {
+        // 200k chained pages would overflow the stack under recursive loading.
+        let depth = 200_000;
+        let mut fixture = Cursor::new(copc_with_deep_child_page_chain(depth));
+
+        let file = CopcFile::from_reader(&mut fixture).unwrap();
+
+        assert_eq!(file.hierarchy().len(), depth);
+    }
+
+    #[test]
+    fn rejects_hierarchy_point_total_exceeding_header_count() {
+        // Entries sum to 12 points; lower the header count to 11.
+        let mut bytes = copc_with_child_hierarchy_page();
+        put_u64(&mut bytes, 247, 11);
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("hierarchy point total"));
+    }
+
+    #[test]
+    fn rejects_huge_claimed_point_count_before_allocation() {
+        let mut bytes = copc_with_child_hierarchy_page();
+        let copc_info_data = usize::from(LAS_HEADER_SIZE_14) + VLR_HEADER_BYTES as usize;
+        let root_hier_offset = read_u64(&bytes, copc_info_data + 40) as usize;
+        put_i32(&mut bytes, root_hier_offset + 28, i32::MAX);
+
+        let err = CopcFile::from_reader(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert!(err.to_string().contains("hierarchy point total"));
+    }
+
+    #[test]
     fn truncated_inputs_fail_without_panicking() {
         let bytes = copc_with_child_hierarchy_page();
         for len in [
@@ -967,6 +1044,88 @@ mod tests {
         out.extend_from_slice(&root_page_bytes);
         assert_eq!(out.len() as u64, child_page_offset);
         out.extend_from_slice(&child_page_bytes);
+        out
+    }
+
+    /// A COPC file whose hierarchy is a linear chain of `depth` single-entry
+    /// pages, each pointing at the next; the final page holds one empty entry.
+    fn copc_with_deep_child_page_chain(depth: usize) -> Vec<u8> {
+        assert!(depth >= 2);
+        let mut laz_vlr_bytes = Vec::new();
+        LazVlrBuilder::default()
+            .with_point_format(6, 0)
+            .unwrap()
+            .with_variable_chunk_size()
+            .build()
+            .write_to(&mut laz_vlr_bytes)
+            .unwrap();
+
+        let offset_to_point_data = u32::from(LAS_HEADER_SIZE_14)
+            + (54 + copc_core::info::COPC_INFO_BYTES as u32)
+            + (54 + laz_vlr_bytes.len() as u32);
+        let evlr_start = u64::from(offset_to_point_data);
+        let root_hier_offset = evlr_start + 60;
+        let page_offset = |page: usize| root_hier_offset + (page * HIERARCHY_ENTRY_BYTES) as u64;
+
+        let info = CopcInfo {
+            center: (0.0, 0.0, 0.0),
+            halfsize: 10.0,
+            spacing: 1.0,
+            root_hier_offset,
+            root_hier_size: HIERARCHY_ENTRY_BYTES as u64,
+            gpstime_min: 0.0,
+            gpstime_max: 0.0,
+        };
+
+        let mut out = Vec::new();
+        write_las_header(&mut out, offset_to_point_data, evlr_start, 0);
+        write_vlr(&mut out, "copc", 1, &info.write_le_bytes(), "COPC info");
+        write_vlr(
+            &mut out,
+            "laszip encoded",
+            22204,
+            &laz_vlr_bytes,
+            "http://laszip.org",
+        );
+        assert_eq!(out.len(), offset_to_point_data as usize);
+        write_evlr_header(
+            &mut out,
+            "copc",
+            1000,
+            (depth * HIERARCHY_ENTRY_BYTES) as u64,
+            "COPC hierarchy",
+        );
+        assert_eq!(out.len() as u64, root_hier_offset);
+        for page in 0..depth {
+            let entry = if page + 1 < depth {
+                Entry {
+                    key: VoxelKey {
+                        level: (page + 1) as i32,
+                        x: 0,
+                        y: 0,
+                        z: 0,
+                    },
+                    offset: page_offset(page + 1),
+                    byte_size: HIERARCHY_ENTRY_BYTES as i32,
+                    point_count: -1,
+                }
+            } else {
+                Entry {
+                    key: VoxelKey {
+                        level: depth as i32,
+                        x: 0,
+                        y: 0,
+                        z: 0,
+                    },
+                    offset: 0,
+                    byte_size: 0,
+                    point_count: 0,
+                }
+            };
+            let mut entry_bytes = [0u8; HIERARCHY_ENTRY_BYTES];
+            entry.write_le(&mut entry_bytes).unwrap();
+            out.extend_from_slice(&entry_bytes);
+        }
         out
     }
 

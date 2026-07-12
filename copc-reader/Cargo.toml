@@ -16,8 +16,13 @@ exclude = [
     "tests/fixtures/external/**",
 ]
 
+[features]
+## Parallel chunk decoding for column reads with rayon.
+parallel = ["dep:rayon"]
+
 [dependencies]
 byteorder = { workspace = true }
 copc-core = { version = "0.4.2", path = "../copc-core" }
 las = { workspace = true }
 laz = { workspace = true }
+rayon = { workspace = true, optional = true }

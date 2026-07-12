@@ -15,4 +15,5 @@ byteorder = "1"
 las = { version = "0.8", features = ["laz"] }
 laz = "0.8"
 memmap2 = "0.9"
+rayon = "1"
 thiserror = "2"
