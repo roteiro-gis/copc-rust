@@ -34,5 +34,6 @@ ureq = { version = "2", optional = true, default-features = false }
 
 [dev-dependencies]
 copc-writer = { path = "../copc-writer" }
+criterion = { workspace = true }
 tempfile = { workspace = true }
 tiny_http = "0.12"

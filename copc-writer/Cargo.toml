@@ -28,3 +28,12 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 copc-reader = { version = "0.4.2", path = "../copc-reader" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "convert"
+harness = false
+
+[[bench]]
+name = "read"
+harness = false
