@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 mod points;
+mod range_read;
+mod ranged;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -24,6 +26,10 @@ pub use copc_core::{
     ColumnData, ColumnSelection, ColumnSpec, ColumnView, LasColumnBatch, LasDimension, ScalarType,
 };
 pub use points::{BoundsSelection, CopcReader, LodSelection, PointIter, PointQuery};
+#[cfg(feature = "http")]
+pub use range_read::HttpRangeReader;
+pub use range_read::RangeRead;
+pub use ranged::CopcRangeReader;
 
 const LAS_HEADER_SIZE_14: u16 = 375;
 const VLR_HEADER_BYTES: u64 = 54;

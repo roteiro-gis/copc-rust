@@ -331,6 +331,45 @@ impl ChunkColumnDecoder {
     }
 }
 
+/// Decodes one chunk's compressed bytes into `las::Point` rows, appending
+/// bounds-accepted points to `out`.
+pub(crate) fn decode_chunk_points(
+    chunk_bytes: &[u8],
+    points_in_chunk: usize,
+    laz_vlr: &LazVlr,
+    point_format: &LasPointFormat,
+    transforms: &Vector<Transform>,
+    bounds: Option<Bounds>,
+    out: &mut Vec<Point>,
+) -> Result<()> {
+    let mut decompressor = LayeredPointRecordDecompressor::new(Cursor::new(chunk_bytes));
+    let record_size = configure_layered_decompressor(&mut decompressor, laz_vlr)?;
+    if record_size != usize::from(point_format.len()) {
+        return Err(Error::InvalidData(format!(
+            "LASzip item size is {record_size} bytes, but LAS point record length is {} bytes",
+            point_format.len()
+        )));
+    }
+    let mut point_buf = vec![0u8; record_size];
+    for _ in 0..points_in_chunk {
+        decompressor
+            .decompress_next(&mut point_buf)
+            .map_err(|e| Error::io("decompress COPC point", e))?;
+        let raw_point = las::raw::Point::read_from(point_buf.as_slice(), point_format)
+            .map_err(|e| Error::Las(e.to_string()))?;
+        if let Some(bounds) = bounds {
+            let x = transforms.x.direct(raw_point.x);
+            let y = transforms.y.direct(raw_point.y);
+            let z = transforms.z.direct(raw_point.z);
+            if !bounds.contains_xyz(x, y, z) {
+                continue;
+            }
+        }
+        out.push(Point::new(raw_point, transforms));
+    }
+    Ok(())
+}
+
 /// Validates the LASzip item layout against the LAS point record length and
 /// returns the record size.
 fn validated_record_size(laz_vlr: &LazVlr, point_format: &LasPointFormat) -> Result<usize> {
