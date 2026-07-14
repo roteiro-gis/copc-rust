@@ -107,7 +107,7 @@ pub struct ColumnBatchSource<'a> {
     edge_of_flight_line: Option<&'a [bool]>,
     classification: Option<&'a [u8]>,
     user_data: Option<&'a [u8]>,
-    scan_angle_rank: Option<&'a [i16]>,
+    scan_angle: Option<&'a [f32]>,
     point_source_id: Option<&'a [u16]>,
     gps_time: Option<&'a [f64]>,
     red: Option<&'a [u16]>,
@@ -147,7 +147,7 @@ impl<'a> ColumnBatchSource<'a> {
             edge_of_flight_line: optional_bool_column(batch, LasDimension::EdgeOfFlightLine)?,
             classification: optional_u8_column(batch, LasDimension::Classification)?,
             user_data: optional_u8_column(batch, LasDimension::UserData)?,
-            scan_angle_rank: optional_i16_column(batch, LasDimension::ScanAngleRank)?,
+            scan_angle: optional_f32_column(batch, LasDimension::ScanAngle)?,
             point_source_id: optional_u16_column(batch, LasDimension::PointSourceId)?,
             gps_time: optional_f64_column(batch, LasDimension::GpsTime)?,
             red,
@@ -210,10 +210,7 @@ impl CopcPointSource for ColumnBatchSource<'_> {
             edge_of_flight_line: at_bool_u8(self.edge_of_flight_line, index),
             classification: at_u8(self.classification, index),
             user_data: at_u8(self.user_data, index),
-            scan_angle: self
-                .scan_angle_rank
-                .map(|column| column[index] as f32 * 90.0 / 180.0)
-                .unwrap_or(0.0),
+            scan_angle: self.scan_angle.map(|column| column[index]).unwrap_or(0.0),
             point_source_id: at_u16(self.point_source_id, index),
             gps_time: self.gps_time.map(|column| column[index]).unwrap_or(0.0),
             red: at_u16(self.red, index),
@@ -297,10 +294,10 @@ fn optional_f64_column(batch: &LasColumnBatch, dimension: LasDimension) -> Resul
     }
 }
 
-fn optional_i16_column(batch: &LasColumnBatch, dimension: LasDimension) -> Result<Option<&[i16]>> {
+fn optional_f32_column(batch: &LasColumnBatch, dimension: LasDimension) -> Result<Option<&[f32]>> {
     match batch.column(dimension) {
-        Some(ColumnData::I16(values)) => Ok(Some(values)),
-        Some(other) => Err(unexpected_column_type(dimension, "I16", other)),
+        Some(ColumnData::F32(values)) => Ok(Some(values)),
+        Some(other) => Err(unexpected_column_type(dimension, "F32", other)),
         None => Ok(None),
     }
 }
@@ -998,6 +995,14 @@ fn validate_point_flags(index: usize, fields: &CopcPointFields) -> Result<()> {
         0,
         1,
     )
+}
+
+/// LAS 1.4 scaled scan angle from degrees, rounded to the nearest 0.006°
+/// increment. (`las::raw::point::ScanAngle::from(f32)` truncates instead,
+/// losing up to a full increment.) Float-to-int casts saturate, and inputs
+/// are range-validated by `validate_scan_angle` before encoding.
+fn scan_angle_to_las_scaled(value: f32) -> i16 {
+    (value / LAS_14_SCAN_ANGLE_SCALE).round() as i16
 }
 
 fn validate_scan_angle(index: usize, value: f32) -> Result<()> {
@@ -2152,7 +2157,7 @@ fn encode_point_record(
                 | (fields.edge_of_flight_line << 7),
             fields.classification,
         ),
-        scan_angle: raw::point::ScanAngle::from(fields.scan_angle),
+        scan_angle: raw::point::ScanAngle::Scaled(scan_angle_to_las_scaled(fields.scan_angle)),
         user_data: fields.user_data,
         point_source_id: fields.point_source_id,
         gps_time: Some(fields.gps_time),

@@ -270,7 +270,7 @@ fn column_batch(count: usize) -> LasColumnBatch {
     let mut classification = Vec::with_capacity(count);
     let mut scan_direction_flag = Vec::with_capacity(count);
     let mut edge_of_flight_line = Vec::with_capacity(count);
-    let mut scan_angle_rank = Vec::with_capacity(count);
+    let mut scan_angle = Vec::with_capacity(count);
     let mut user_data = Vec::with_capacity(count);
     let mut point_source_id = Vec::with_capacity(count);
     let mut synthetic = Vec::with_capacity(count);
@@ -293,7 +293,7 @@ fn column_batch(count: usize) -> LasColumnBatch {
         classification.push(if i % 2 == 0 { 2 } else { 6 });
         scan_direction_flag.push(i % 2 == 0);
         edge_of_flight_line.push(i % 5 == 0);
-        scan_angle_rank.push((i as i16 % 181) - 90);
+        scan_angle.push(((i % 181) as f32 - 90.0) * 0.006);
         user_data.push((i % 251) as u8);
         point_source_id.push((1_000 + i) as u16);
         synthetic.push(i % 7 == 0);
@@ -326,10 +326,7 @@ fn column_batch(count: usize) -> LasColumnBatch {
             LasDimension::EdgeOfFlightLine,
             ColumnData::Bool(edge_of_flight_line),
         ),
-        column(
-            LasDimension::ScanAngleRank,
-            ColumnData::I16(scan_angle_rank),
-        ),
+        column(LasDimension::ScanAngle, ColumnData::F32(scan_angle)),
         column(LasDimension::UserData, ColumnData::U8(user_data)),
         column(
             LasDimension::PointSourceId,

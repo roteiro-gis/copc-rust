@@ -16,7 +16,9 @@ pub enum LasDimension {
     Classification,
     ScanDirectionFlag,
     EdgeOfFlightLine,
-    ScanAngleRank,
+    /// Scan angle in degrees. LAS 1.4 stores it as a scaled i16 in 0.006°
+    /// increments; the column carries the decoded degrees losslessly.
+    ScanAngle,
     UserData,
     PointSourceId,
     Synthetic,
@@ -41,8 +43,7 @@ impl LasDimension {
     pub const fn default_scalar(self) -> Option<ScalarType> {
         match self {
             Self::X | Self::Y | Self::Z | Self::GpsTime => Some(ScalarType::F64),
-            Self::WavePacketReturnPointWaveformLocation => Some(ScalarType::F32),
-            Self::ScanAngleRank => Some(ScalarType::I16),
+            Self::ScanAngle | Self::WavePacketReturnPointWaveformLocation => Some(ScalarType::F32),
             Self::WaveformPacketByteOffset => Some(ScalarType::U64),
             Self::Intensity
             | Self::PointSourceId
@@ -94,7 +95,7 @@ impl ColumnSelection {
             LasDimension::Classification,
             LasDimension::ScanDirectionFlag,
             LasDimension::EdgeOfFlightLine,
-            LasDimension::ScanAngleRank,
+            LasDimension::ScanAngle,
             LasDimension::UserData,
             LasDimension::PointSourceId,
             LasDimension::Synthetic,
@@ -433,7 +434,7 @@ pub fn layout_for_las_format(format: LasPointFormat) -> Vec<ColumnSpec> {
             LasDimension::Classification,
             LasDimension::ScanDirectionFlag,
             LasDimension::EdgeOfFlightLine,
-            LasDimension::ScanAngleRank,
+            LasDimension::ScanAngle,
             LasDimension::UserData,
             LasDimension::PointSourceId,
             LasDimension::Synthetic,
@@ -471,12 +472,6 @@ pub fn layout_for_las_format(format: LasPointFormat) -> Vec<ColumnSpec> {
         columns.push(ColumnSpec::extra_bytes(usize::from(format.extra_bytes)));
     }
     columns
-}
-
-/// Converts scan angle degrees into the rank-style column used by existing readers.
-pub fn scan_angle_rank_from_degrees(degrees: f32) -> i16 {
-    let scaled = (degrees * 180.0 / 90.0).round() as i32;
-    scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 fn push_default_specs<I>(columns: &mut Vec<ColumnSpec>, dims: I)
@@ -575,7 +570,7 @@ mod tests {
             LasDimension::Classification,
             LasDimension::ScanDirectionFlag,
             LasDimension::EdgeOfFlightLine,
-            LasDimension::ScanAngleRank,
+            LasDimension::ScanAngle,
             LasDimension::UserData,
             LasDimension::PointSourceId,
             LasDimension::Synthetic,
@@ -699,11 +694,12 @@ mod tests {
         assert!(ColumnSpec::new(LasDimension::ExtraBytes, ScalarType::U8)
             .validate_default_scalar()
             .is_err());
-        assert!(
-            ColumnSpec::new(LasDimension::ScanAngleRank, ScalarType::F32)
-                .validate_default_scalar()
-                .is_err()
-        );
+        assert!(ColumnSpec::new(LasDimension::ScanAngle, ScalarType::I16)
+            .validate_default_scalar()
+            .is_err());
+        assert!(ColumnSpec::new(LasDimension::ScanAngle, ScalarType::F32)
+            .validate_default_scalar()
+            .is_ok());
     }
 
     #[test]
@@ -731,15 +727,6 @@ mod tests {
         let all = ColumnSelection::all();
         assert!(all.contains(LasDimension::WaveformPacketByteOffset));
         assert!(all.contains(LasDimension::ExtraBytes));
-    }
-
-    #[test]
-    fn scan_angle_rank_uses_engine_conversion() {
-        assert_eq!(0, scan_angle_rank_from_degrees(0.0));
-        assert_eq!(91, scan_angle_rank_from_degrees(45.25));
-        assert_eq!(-91, scan_angle_rank_from_degrees(-45.25));
-        assert_eq!(i16::MAX, scan_angle_rank_from_degrees(f32::MAX));
-        assert_eq!(i16::MIN, scan_angle_rank_from_degrees(f32::MIN));
     }
 
     #[test]

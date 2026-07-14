@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use copc_core::{
-    scan_angle_rank_from_degrees, Bounds, ColumnData, ColumnSelection, LasColumnBatch, LasDimension,
-};
+use copc_core::{Bounds, ColumnData, ColumnSelection, LasColumnBatch, LasDimension};
 use copc_reader::{BoundsSelection, CopcFile, CopcReader, LodSelection, PointQuery};
 use las::point::ScanDirection;
 
@@ -194,10 +192,10 @@ fn assert_columns_match_points(batch: &LasColumnBatch, points: &[las::Point]) {
             .as_slice()
     );
     assert_eq!(
-        column_i16(batch, LasDimension::ScanAngleRank),
+        column_f32(batch, LasDimension::ScanAngle),
         points
             .iter()
-            .map(|point| scan_angle_rank_from_degrees(point.scan_angle))
+            .map(|point| point.scan_angle)
             .collect::<Vec<_>>()
             .as_slice()
     );
@@ -316,9 +314,9 @@ fn column_f64(batch: &LasColumnBatch, dimension: LasDimension) -> &[f64] {
     }
 }
 
-fn column_i16(batch: &LasColumnBatch, dimension: LasDimension) -> &[i16] {
+fn column_f32(batch: &LasColumnBatch, dimension: LasDimension) -> &[f32] {
     match batch.column(dimension).unwrap() {
-        ColumnData::I16(values) => values,
+        ColumnData::F32(values) => values,
         other => panic!(
             "{dimension:?} column has unexpected type {:?}",
             other.scalar()
