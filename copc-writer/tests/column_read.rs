@@ -1,7 +1,8 @@
 use copc_core::{Bounds, ColumnData, ColumnSpec, LasColumnBatch, LasDimension};
 use copc_reader::{BoundsSelection, ColumnSelection, CopcReader, LodSelection, PointQuery};
 use copc_writer::{
-    write_source, ColumnBatchSource, CopcPointFields, CopcPointSource, CopcWriterParams,
+    write_source, ColumnBatchSource, CopcPointFields, CopcPointSource, CopcWriteMetadata,
+    CopcWriterParams,
 };
 
 struct VecSource {
@@ -18,8 +19,9 @@ impl CopcPointSource for VecSource {
         (point.x, point.y, point.z)
     }
 
-    fn fields(&self, index: usize) -> copc_core::Result<CopcPointFields> {
-        Ok(self.points[index].clone())
+    fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {
+        out.clone_from(&self.points[index]);
+        Ok(())
     }
 }
 
@@ -37,10 +39,8 @@ fn read_columns_matches_synthetic_copc_rows() {
         &source,
         true,
         bounds,
-        &CopcWriterParams {
-            max_points_per_node: 64,
-            max_depth: 6,
-        },
+        &CopcWriterParams::new(64),
+        &CopcWriteMetadata::default(),
     )
     .unwrap();
 
@@ -191,10 +191,8 @@ fn column_batch_source_writes_columns_readable_by_reader() {
         &source,
         source.has_color(),
         source.bounds().unwrap(),
-        &CopcWriterParams {
-            max_points_per_node: 1_024,
-            max_depth: 4,
-        },
+        &CopcWriterParams::new(1_024),
+        &CopcWriteMetadata::default(),
     )
     .unwrap();
 

@@ -1,25 +1,29 @@
 use std::path::Path;
 
 use copc_core::{LasPointRecord, NeverCancel, StreamingLayout};
-use copc_writer::{write_streaming_with_cancel, CopcWriterParams, SpillWriter};
+use copc_writer::{write_streaming_with_cancel, CopcWriteMetadata, CopcWriterParams, SpillWriter};
 use las::Read as _;
 
 #[test]
 fn lod_index_and_spill_remain_disk_backed() {
     let writer_src = production_section(include_str!("../src/writer.rs"));
+    let lod_src = production_section(include_str!("../src/lod.rs"));
     let spill_src = production_section(include_str!("../src/spill.rs"));
 
-    assert_contains(writer_src, "struct LodIndex");
-    assert_contains(writer_src, "order_path: TempPath");
-    assert_contains(writer_src, "struct IndexRun");
-    assert_contains(writer_src, "path: TempPath");
-    assert_contains(writer_src, "fn build_lod_index");
-    assert_contains(writer_src, "write_root_index_run(total_points, cancel)?");
-    assert_contains(writer_src, "fn partition_index_run");
-    assert_contains(writer_src, "new_index_tempfile(\"root\")");
-    assert_contains(writer_src, "new_index_tempfile(\"partition\")");
-    assert_contains(writer_src, "open_index_run(run)?");
-    assert_contains(writer_src, "append_index_to_order(");
+    assert_contains(lod_src, "struct LodIndex");
+    assert_contains(lod_src, "order_path: TempPath");
+    assert_contains(lod_src, "struct IndexRun");
+    assert_contains(lod_src, "path: TempPath");
+    assert_contains(lod_src, "fn build_lod_index");
+    assert_contains(lod_src, "write_root_index_run(total_points, cancel)?");
+    assert_contains(lod_src, "fn partition_index_run");
+    assert_contains(lod_src, "new_index_tempfile(\"root\")");
+    assert_contains(lod_src, "new_index_tempfile(\"partition\")");
+    assert_contains(lod_src, "open_index_run(run)?");
+    assert_contains(lod_src, "append_index_to_order(");
+    assert_not_contains(lod_src, "Vec<LasPointRecord>");
+    assert_not_contains(lod_src, "Vec<CopcPointFields>");
+    assert_not_contains(lod_src, "Vec<u32>");
     assert_not_contains(writer_src, "Vec<LasPointRecord>");
     assert_not_contains(writer_src, "Vec<CopcPointFields>");
     assert_not_contains(writer_src, "Vec<u32>");
@@ -75,10 +79,8 @@ fn large_streaming_conversion_peak_rss_stays_bounded() {
             len: point_count,
             extra_bytes,
         },
-        &CopcWriterParams {
-            max_points_per_node: 20_000,
-            max_depth: 8,
-        },
+        &CopcWriterParams::new(20_000),
+        &CopcWriteMetadata::default(),
         &spill_dir,
         &NeverCancel,
     )

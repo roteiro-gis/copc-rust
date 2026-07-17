@@ -7,14 +7,20 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use copc_core::{
-    deserialize_le, serialize_le, Bounds, Error, LasPointRecord, Result, StreamingLayout,
+    deserialize_le_into, serialize_le, Bounds, Error, LasPointRecord, Result, StreamingLayout,
 };
 use memmap2::Mmap;
 use tempfile::{NamedTempFile, TempPath};
 
+use crate::validate::{validate_spill_record, PointStats};
+
 const SPILL_IO_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Streams `LasPointRecord` values to a process-local temporary spill file.
+///
+/// Records are validated at intake (coordinates, scan angle, LAS field
+/// ranges, GPS time) and output statistics are accumulated as they stream in,
+/// so spill-backed COPC writes need no second validation pass over the data.
 pub struct SpillWriter {
     #[cfg(test)]
     path: PathBuf,
@@ -24,6 +30,7 @@ pub struct SpillWriter {
     scratch: Vec<u8>,
     count: u64,
     bounds: Option<Bounds>,
+    stats: PointStats,
 }
 
 impl SpillWriter {
@@ -45,10 +52,15 @@ impl SpillWriter {
             scratch: vec![0u8; record_width],
             count: 0,
             bounds: None,
+            stats: PointStats::new(),
         })
     }
 
     pub fn push(&mut self, record: &LasPointRecord) -> Result<()> {
+        let index = usize::try_from(self.count).unwrap_or(usize::MAX);
+        validate_spill_record(record, index)?;
+        self.stats
+            .record(index, record.gps_time, record.return_number)?;
         serialize_le(record, &self.layout, &mut self.scratch)
             .map_err(|e| Error::InvalidInput(format!("encode spill record: {e}")))?;
         let writer = self
@@ -98,6 +110,7 @@ impl SpillWriter {
             self.record_width,
             count,
             bounds,
+            self.stats,
         )
     }
 }
@@ -113,9 +126,11 @@ pub struct SpillReader {
     record_width: usize,
     count: usize,
     bounds: Bounds,
+    stats: PointStats,
 }
 
 impl SpillReader {
+    #[allow(clippy::too_many_arguments)]
     fn open(
         temp_path: TempPath,
         file: File,
@@ -123,6 +138,7 @@ impl SpillReader {
         record_width: usize,
         count: usize,
         bounds: Bounds,
+        stats: PointStats,
     ) -> Result<Self> {
         #[cfg(test)]
         let path = temp_path.to_path_buf();
@@ -147,7 +163,12 @@ impl SpillReader {
             record_width,
             count,
             bounds,
+            stats,
         })
+    }
+
+    pub(crate) fn stats(&self) -> PointStats {
+        self.stats
     }
 
     pub fn len(&self) -> usize {
@@ -183,13 +204,20 @@ impl SpillReader {
     }
 
     pub fn record_at(&self, index: usize) -> Result<LasPointRecord> {
+        let mut record = LasPointRecord::default();
+        self.record_into(index, &mut record)?;
+        Ok(record)
+    }
+
+    /// Decode the record at `index` into `out`, reusing its allocations.
+    pub fn record_into(&self, index: usize, out: &mut LasPointRecord) -> Result<()> {
         if index >= self.count {
             return Err(Error::InvalidInput(format!(
                 "spill index {index} out of range (len {})",
                 self.count
             )));
         }
-        deserialize_le(self.record_bytes(index), &self.layout)
+        deserialize_le_into(self.record_bytes(index), &self.layout, out)
             .map_err(|e| Error::InvalidData(format!("decode spill record {index}: {e}")))
     }
 }
