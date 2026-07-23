@@ -2,6 +2,88 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-07-10
+
+Security hardening, breaking API corrections, hot-path performance work,
+optional parallelism, and a lazy remote range reader.
+
+### Security
+
+- load hierarchy pages with an explicit worklist instead of recursion, so a
+  crafted file with a deep chain of child pages can no longer overflow the
+  stack
+- reject files whose hierarchy point totals exceed the LAS header point count,
+  and cap the column capacity reserved up front from untrusted chunk counts
+- cap source EVLR counts read during LAS/LAZ-to-COPC conversion at 4,096,
+  matching the reader's limit (shared via `copc_core::limits`)
+- reject `write_source` points that lie outside the declared bounds; they
+  would otherwise land in octree voxels whose bounds don't contain them and
+  silently vanish from readers' spatial queries
+- add cargo-fuzz targets for COPC open and point reads with a CI smoke run,
+  plus a cargo-audit CI job
+
+### Breaking
+
+- `LasDimension::ScanAngleRank` (i16, degrees×2) is now
+  `LasDimension::ScanAngle` (F32, degrees). Column reads and
+  `ColumnBatchSource` writes carry scan angles losslessly to LAS 1.4's 0.006°
+  resolution; `copc_core::scan_angle_rank_from_degrees` is removed. Migrate
+  columns by multiplying old rank values by 0.5 to get degrees.
+- `CopcWriterParams` loses `max_depth` (it was silently clamped to an internal
+  21-30 range and never behaved as documented) and is `#[non_exhaustive]`;
+  construct it with `CopcWriterParams::new(max_points_per_node)` or
+  `::default()`.
+- `write_source`, `write_source_with_cancel`, and
+  `write_streaming_with_cancel` take a new `&CopcWriteMetadata` parameter for
+  WKT CRS, GUID, identifiers, creation date, GPS time type, and scale/offset
+  overrides; pass `&CopcWriteMetadata::default()` to keep prior behavior.
+- `CopcPointSource::fields` is now
+  `fields_into(&self, index, out: &mut CopcPointFields)`, reusing the output's
+  allocations across points; `CopcPointFields` gains `Default`.
+- generated PDRF 6/7 files now always set the LAS WKT global-encoding bit and
+  carry a WKT CRS VLR (empty when no CRS is supplied), as LAS 1.4 requires;
+  header creation dates default to the current UTC date instead of a
+  hardcoded year.
+- `SpillWriter::push` now validates records (coordinates, scan angle, LAS
+  field ranges, GPS time) at intake and accumulates output statistics, so
+  spill-backed writes skip the second full validation pass.
+
+### Added
+
+- `CopcRangeReader` in `copc-reader`: a lazy reader over a new `RangeRead`
+  byte-range trait that fetches the header and VLRs at open, loads hierarchy
+  pages only when a query's LOD/bounds can reach them, coalesces adjacent
+  chunk fetches (64 KiB gap threshold), and exposes `hierarchy_for`,
+  `read_points`, and `read_columns`
+- `HttpRangeReader` behind the `http` feature (plain HTTP; enable `http-tls`
+  for HTTPS) using HTTP `Range` requests, verified against a local
+  range-serving test server
+- optional `parallel` feature in both `copc-writer` (rayon-parallel per-node
+  LAZ chunk compression with a hand-assembled chunk table that plain LAZ
+  readers accept) and `copc-reader` (parallel chunk decoding for column reads)
+- criterion benchmarks for reader row/column throughput and streaming
+  conversion
+
+### Fixed
+
+- writer scan angles are now rounded to the nearest LAS 1.4 0.006° increment
+  instead of truncated (up to a full increment of error via
+  `las::raw::point::ScanAngle::from(f32)`)
+- failed writes no longer leave a partial output file: output is written to a
+  same-directory temp file and atomically renamed on success
+
+### Performance
+
+- column reads decode fields directly from decompressed record bytes instead
+  of materializing a `las::raw::Point` per point (~9% faster full-column
+  reads; column reads now run at the raw LAZ-decode floor)
+- point encoding writes the PDRF 6/7 layout directly, eliminating two
+  per-point heap allocations in the compression loop (guarded by a
+  byte-identity test against `las::raw::Point`)
+- spill-backed writes validate once at intake instead of re-deserializing
+  every record in a second pass; per-point `format!` allocations removed from
+  the stats path
+
 ## 0.4.2 - 2026-07-05
 
 - add a proj-free CRS WKT override hook for LAS/LAZ-to-COPC streaming

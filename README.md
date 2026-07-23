@@ -76,6 +76,44 @@ For GeoTIFF-only CRS inputs, resolve CRS externally and call
 `convert_las_to_copc_streaming_with_crs_wkt_override` with `Some(wkt)`; the
 writer emits the supplied WKT CRS VLR without depending on a geodesy library.
 
+Generated files carry caller metadata through `CopcWriteMetadata` (WKT CRS,
+GUID, identifiers, creation date, GPS time type, scale/offset overrides):
+
+```rust
+use copc_writer::{write_source, CopcWriteMetadata, CopcWriterParams};
+
+let mut metadata = CopcWriteMetadata::default();
+metadata.wkt_crs = Some(wgs84_wkt.to_string());
+write_source(&path, &source, false, bounds, &CopcWriterParams::default(), &metadata)?;
+```
+
+Remote and partial reads go through `CopcRangeReader`, which fetches only the
+header and VLRs at open, loads hierarchy pages lazily as queries reach them,
+and coalesces adjacent chunk fetches into single range requests:
+
+```rust
+use copc_reader::{ColumnSelection, CopcRangeReader, HttpRangeReader, PointQuery};
+
+// Requires the `http` feature (plus `http-tls` for HTTPS URLs).
+let source = HttpRangeReader::new("http://example.com/cloud.copc.laz");
+let mut reader = CopcRangeReader::open(source)?;
+let batch = reader.read_columns(PointQuery::all(), ColumnSelection::xyz())?;
+```
+
+Any byte-range source works by implementing the `RangeRead` trait;
+`std::fs::File` implements it out of the box.
+
+## Feature Flags
+
+All features are off by default, keeping the crates dependency-light.
+
+| Crate | Feature | Effect |
+|---|---|---|
+| `copc-writer` | `parallel` | rayon-parallel LAZ chunk compression (one octree node per chunk, written in order with a standard chunk table) |
+| `copc-reader` | `parallel` | rayon-parallel chunk decoding for `read_columns` |
+| `copc-reader` | `http` | `HttpRangeReader` over HTTP `Range` requests (plain HTTP) |
+| `copc-reader` | `http-tls` | enables `ureq/tls` so `HttpRangeReader` can fetch HTTPS URLs |
+
 ## Column Ownership Model
 
 `copc-core` owns the LAS/COPC-native column model: `LasDimension`,
@@ -114,6 +152,14 @@ behind a future optional feature.
   inputs without adding a geodesy dependency to `copc-writer`
 - LAS 1.4 point formats 6 and 7 with LAZ variable-size chunks
 - Interior-node representative points for native LOD reads
+- Lazy remote reads over byte-range sources (`CopcRangeReader`, `RangeRead`,
+  optional HTTP source) with on-demand hierarchy loading and coalesced chunk
+  fetches
+- Optional rayon parallelism for writer chunk compression and reader column
+  decoding
+- Caller-supplied output metadata (WKT CRS, GUID, identifiers, creation date)
+  for generated COPC files, which always carry the LAS 1.4 WKT
+  global-encoding bit and a WKT CRS VLR
 
 ## Not Yet Supported
 
@@ -125,8 +171,9 @@ behind a future optional feature.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
+cargo test --workspace --all-features
 ```
 
 Checked-in external COPC fixtures from PDAL and QGIS are exercised by:
