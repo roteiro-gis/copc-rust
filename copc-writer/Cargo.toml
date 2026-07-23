@@ -11,6 +11,10 @@ readme = "../README.md"
 documentation = "https://docs.rs/copc-writer"
 keywords = ["copc", "las", "laz", "point-cloud", "gis"]
 categories = ["science", "encoding"]
+exclude = [
+    "tests/**",
+    "benches/**",
+]
 
 [features]
 ## Parallel LAZ chunk compression with rayon; each octree node is still one
@@ -19,12 +23,23 @@ parallel = ["dep:rayon"]
 
 [dependencies]
 byteorder = { workspace = true }
-copc-core = { version = "0.4.2", path = "../copc-core" }
+copc-core = { version = "0.5.0", path = "../copc-core" }
 las = { workspace = true }
 laz = { workspace = true }
 memmap2 = { workspace = true }
 rayon = { workspace = true, optional = true }
 tempfile = { workspace = true }
 
+# Path-only (version-less) so packaging strips it; repo tests and benches
+# needing the reader are excluded from the published package.
 [dev-dependencies]
-copc-reader = { version = "0.4.2", path = "../copc-reader" }
+copc-reader = { path = "../copc-reader" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "convert"
+harness = false
+
+[[bench]]
+name = "read"
+harness = false

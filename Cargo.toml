@@ -1,9 +1,10 @@
 [workspace]
 members = ["copc-core", "copc-reader", "copc-writer"]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT OR Apache-2.0"
@@ -12,6 +13,7 @@ homepage = "https://github.com/roteiro-gis/copc-rust"
 
 [workspace.dependencies]
 byteorder = "1"
+criterion = "0.5"
 las = { version = "0.8", features = ["laz"] }
 laz = "0.8"
 memmap2 = "0.9"

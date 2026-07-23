@@ -1,0 +1,27 @@
+[package]
+name = "copc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+copc-reader = { path = "../copc-reader" }
+copc-core = { path = "../copc-core" }
+
+[[bin]]
+name = "copc_open"
+path = "fuzz_targets/copc_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "copc_points"
+path = "fuzz_targets/copc_points.rs"
+test = false
+doc = false
+bench = false

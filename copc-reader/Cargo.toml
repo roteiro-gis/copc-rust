@@ -12,8 +12,8 @@ documentation = "https://docs.rs/copc-reader"
 keywords = ["copc", "las", "laz", "point-cloud", "gis"]
 categories = ["science", "parser-implementations"]
 exclude = [
-    "tests/external_fixtures.rs",
-    "tests/fixtures/external/**",
+    "tests/**",
+    "benches/**",
 ]
 
 [features]
@@ -26,13 +26,16 @@ http-tls = ["http", "ureq/tls"]
 
 [dependencies]
 byteorder = { workspace = true }
-copc-core = { version = "0.4.2", path = "../copc-core" }
+copc-core = { version = "0.5.0", path = "../copc-core" }
 las = { workspace = true }
 laz = { workspace = true }
 rayon = { workspace = true, optional = true }
 ureq = { version = "2", optional = true, default-features = false }
 
+# Path-only (version-less) so packaging strips it; repo tests and benches
+# needing the writer are excluded from the published package.
 [dev-dependencies]
 copc-writer = { path = "../copc-writer" }
+criterion = { workspace = true }
 tempfile = { workspace = true }
 tiny_http = "0.12"
