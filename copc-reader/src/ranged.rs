@@ -16,18 +16,20 @@ use laz::LazVlr;
 
 use crate::points::{
     decode_chunk_points, select_point_chunks_from, selected_column_builders,
-    total_candidate_points, voxel_bounds, BoundsSelection, ChunkColumnDecoder, PointQuery,
-    MAX_INITIAL_COLUMN_RESERVE_POINTS,
+    total_candidate_points, validate_query, voxel_bounds, BoundsSelection, ChunkColumnDecoder,
+    PointQuery, MAX_INITIAL_COLUMN_RESERVE_POINTS,
 };
 use crate::range_read::RangeRead;
 use crate::{
-    extract_required_vlrs, point_format_for, read_las_header, read_vlrs, transforms_for,
-    validate_hierarchy_entry, validate_range_in_file, HierarchyReadLimits, LasHeader,
-    LAS_HEADER_SIZE_14,
+    extract_required_vlrs, insert_point_chunk_range, point_format_for, read_las_header, read_vlrs,
+    transforms_for, validate_hierarchy_entry, validate_hierarchy_page_byte_size,
+    validate_range_in_file, CopcDataRanges, HierarchyReadLimits, LasHeader, LAS_HEADER_SIZE_14,
 };
 
 /// Adjacent chunk ranges closer than this are fetched with one request.
 const RANGE_COALESCE_GAP_BYTES: u64 = 64 * 1024;
+/// Bound one remote allocation when many nearby chunks are coalesced.
+const MAX_COALESCED_RANGE_BYTES: u64 = 64 * 1024 * 1024;
 /// Cap on the VLR section fetched eagerly at open.
 const MAX_VLR_SECTION_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -51,12 +53,18 @@ impl SectionReader {
 
 impl Read for SectionReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let start = self.position.checked_sub(self.base).ok_or_else(|| {
+        let start = usize::try_from(self.position.checked_sub(self.base).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "read before fetched section",
             )
-        })? as usize;
+        })?)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fetched section position exceeds usize",
+            )
+        })?;
         if start > self.data.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -103,6 +111,8 @@ pub struct CopcRangeReader<S: RangeRead> {
     visited_pages: HashSet<(u64, u64)>,
     limits: HierarchyReadLimits,
     loaded_point_total: u64,
+    data_ranges: CopcDataRanges,
+    point_ranges: BTreeMap<u64, (u64, VoxelKey)>,
 }
 
 impl<S: RangeRead> CopcRangeReader<S> {
@@ -139,6 +149,10 @@ impl<S: RangeRead> CopcRangeReader<S> {
             u64::from(header.offset_to_point_data),
         )?;
         let (copc_info, laszip_vlr) = extract_required_vlrs(&vlrs)?;
+        validate_hierarchy_page_byte_size(copc_info.root_hier_size)?;
+        let (hierarchy_start, hierarchy_len) =
+            validate_root_hierarchy_evlr(&mut source, file_len, &copc_info)?;
+        let data_ranges = CopcDataRanges::new(&header, hierarchy_start, hierarchy_len)?;
 
         let mut reader = Self {
             source,
@@ -151,6 +165,8 @@ impl<S: RangeRead> CopcRangeReader<S> {
             visited_pages: HashSet::new(),
             limits: HierarchyReadLimits::default(),
             loaded_point_total: 0,
+            data_ranges,
+            point_ranges: BTreeMap::new(),
         };
         let root = Entry {
             key: VoxelKey::root(),
@@ -174,6 +190,7 @@ impl<S: RangeRead> CopcRangeReader<S> {
     /// Point-data hierarchy entries matching `query`, loading any hierarchy
     /// pages the query can reach that have not been fetched yet.
     pub fn hierarchy_for(&mut self, query: PointQuery) -> Result<Vec<Entry>> {
+        validate_query(query)?;
         self.ensure_hierarchy_for(query)?;
         select_point_chunks_from(self.hierarchy.values(), &self.copc_info, query)
     }
@@ -202,7 +219,7 @@ impl<S: RangeRead> CopcRangeReader<S> {
         };
         let mut columns = selected_column_builders(point_format, selection, capacity)?;
         let mut accepted_points = 0usize;
-        for group in coalesce_chunks(&chunks, RANGE_COALESCE_GAP_BYTES) {
+        for group in coalesce_chunks(&chunks, RANGE_COALESCE_GAP_BYTES, MAX_COALESCED_RANGE_BYTES) {
             let bytes = self.fetch_range(group.start, group.end)?;
             for entry in group.entries {
                 let (slice, points_in_chunk) = chunk_slice(&bytes, group.start, entry)?;
@@ -232,7 +249,7 @@ impl<S: RangeRead> CopcRangeReader<S> {
             None => total_candidate_points(&chunks)?.min(MAX_INITIAL_COLUMN_RESERVE_POINTS),
         };
         let mut points = Vec::with_capacity(capacity);
-        for group in coalesce_chunks(&chunks, RANGE_COALESCE_GAP_BYTES) {
+        for group in coalesce_chunks(&chunks, RANGE_COALESCE_GAP_BYTES, MAX_COALESCED_RANGE_BYTES) {
             let bytes = self.fetch_range(group.start, group.end)?;
             for entry in group.entries {
                 let (slice, points_in_chunk) = chunk_slice(&bytes, group.start, entry)?;
@@ -309,14 +326,26 @@ impl<S: RangeRead> CopcRangeReader<S> {
         let bytes = self.fetch_range(page_entry.offset, page_entry.offset + byte_size)?;
         let page = HierarchyPage::from_le_bytes(&bytes)?;
         for entry in page.entries().iter().copied() {
-            validate_hierarchy_entry(entry, self.file_len)?;
-            if let Some(previous) = self.hierarchy.insert(entry.key, entry) {
-                if let EntryAvailability::PointData { point_count } = previous.availability()? {
-                    self.loaded_point_total -= u64::from(point_count);
+            validate_hierarchy_entry(entry, self.file_len, &self.data_ranges)?;
+            match self.hierarchy.get(&entry.key).copied() {
+                None => {}
+                Some(previous) if previous.is_child_page() && !entry.is_child_page() => {}
+                Some(previous) => {
+                    return Err(Error::InvalidData(format!(
+                        "duplicate hierarchy key {:?}: previous {previous:?}, new {entry:?}",
+                        entry.key
+                    )));
                 }
             }
+            if entry.has_point_data() {
+                insert_point_chunk_range(&mut self.point_ranges, entry)?;
+            }
+            self.hierarchy.insert(entry.key, entry);
             if let EntryAvailability::PointData { point_count } = entry.availability()? {
-                self.loaded_point_total += u64::from(point_count);
+                self.loaded_point_total = self
+                    .loaded_point_total
+                    .checked_add(u64::from(point_count))
+                    .ok_or_else(|| Error::InvalidData("hierarchy point total overflow".into()))?;
             }
             if entry.is_child_page() {
                 self.pending_pages.push(entry);
@@ -325,6 +354,13 @@ impl<S: RangeRead> CopcRangeReader<S> {
         if self.loaded_point_total > self.header.number_of_points {
             return Err(Error::InvalidData(format!(
                 "hierarchy point total {} exceeds LAS header point count {}",
+                self.loaded_point_total, self.header.number_of_points
+            )));
+        }
+        if self.pending_pages.is_empty() && self.loaded_point_total != self.header.number_of_points
+        {
+            return Err(Error::InvalidData(format!(
+                "hierarchy point total {} does not match LAS header point count {}",
                 self.loaded_point_total, self.header.number_of_points
             )));
         }
@@ -355,13 +391,16 @@ struct ChunkGroup {
 }
 
 /// Groups offset-sorted chunks so nearby ranges are fetched with one request.
-fn coalesce_chunks(chunks: &[Entry], gap: u64) -> Vec<ChunkGroup> {
+fn coalesce_chunks(chunks: &[Entry], gap: u64, max_range_bytes: u64) -> Vec<ChunkGroup> {
     let mut groups: Vec<ChunkGroup> = Vec::new();
     for entry in chunks {
         let start = entry.offset;
         let end = entry.offset + entry.byte_size.max(0) as u64;
         match groups.last_mut() {
-            Some(group) if start <= group.end.saturating_add(gap) => {
+            Some(group)
+                if start <= group.end.saturating_add(gap)
+                    && end.saturating_sub(group.start) <= max_range_bytes =>
+            {
                 group.end = group.end.max(end);
                 group.entries.push(*entry);
             }
@@ -373,6 +412,41 @@ fn coalesce_chunks(chunks: &[Entry], gap: u64) -> Vec<ChunkGroup> {
         }
     }
     groups
+}
+
+fn validate_root_hierarchy_evlr<S: RangeRead>(
+    source: &mut S,
+    file_len: u64,
+    info: &CopcInfo,
+) -> Result<(u64, u64)> {
+    let header_offset = info
+        .root_hier_offset
+        .checked_sub(60)
+        .ok_or_else(|| Error::InvalidData("COPC root hierarchy has no EVLR header".into()))?;
+    let mut header = [0u8; 60];
+    source.read_range(header_offset, &mut header)?;
+    let reserved = u16::from_le_bytes(header[0..2].try_into().expect("EVLR reserved width"));
+    let user_id = crate::trim_nul(&header[2..18]);
+    let record_id = u16::from_le_bytes(header[18..20].try_into().expect("EVLR record id width"));
+    let body_size = u64::from_le_bytes(header[20..28].try_into().expect("EVLR body size width"));
+    if reserved != 0 || user_id != "copc" || record_id != 1000 {
+        return Err(Error::InvalidData(
+            "COPC root hierarchy must immediately follow a copc/1000 EVLR header".into(),
+        ));
+    }
+    if info.root_hier_size > body_size {
+        return Err(Error::InvalidData(format!(
+            "COPC root hierarchy size {} exceeds hierarchy EVLR body size {body_size}",
+            info.root_hier_size
+        )));
+    }
+    crate::validate_range_in_file(
+        info.root_hier_offset,
+        body_size,
+        file_len,
+        "COPC hierarchy EVLR body",
+    )?;
+    Ok((info.root_hier_offset, body_size))
 }
 
 fn chunk_slice(group_bytes: &[u8], group_start: u64, entry: Entry) -> Result<(&[u8], usize)> {

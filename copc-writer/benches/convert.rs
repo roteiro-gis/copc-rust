@@ -4,7 +4,6 @@ use std::path::Path;
 
 use copc_writer::{convert_las_to_copc_streaming, CopcWriterParams};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use las::Write as _;
 
 const POINT_COUNT: usize = 250_000;
 
@@ -15,7 +14,7 @@ fn write_source_las(path: &Path, count: usize) {
     for index in 0..count {
         let i = index as f64;
         writer
-            .write(las::Point {
+            .write_point(las::Point {
                 x: (index % 1_000) as f64 * 0.75,
                 y: ((index / 1_000) % 1_000) as f64 * 0.75,
                 z: (i * 0.001).sin() * 50.0 + 100.0,

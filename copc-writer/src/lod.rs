@@ -17,11 +17,9 @@ pub(crate) const INDEX_IO_BUFFER_BYTES: usize = 1024 * 1024;
 /// Hard cap on octree subdivision depth: deeper voxel keys would overflow the
 /// i32 key coordinates (level 30 keys reach 2^30). The layered LAZ compressor
 /// buffers an entire COPC chunk (one octree node) in memory before flushing,
-/// so nodes must keep subdividing until they fit `max_points_per_node`. Each
-/// level also drains `max_points_per_node` points into the parent node, so
-/// only pathological inputs (more than `30 * max_points_per_node` points at
-/// nearly identical coordinates) still hit this cap and produce an oversized
-/// leaf chunk.
+/// so nodes must keep subdividing until they fit `max_points_per_node`.
+/// Pathological coincident inputs that cannot fit by this depth are rejected
+/// rather than producing an oversized chunk.
 const MAX_OCTREE_DEPTH: u32 = 30;
 
 pub(crate) struct LodIndex {
@@ -53,7 +51,12 @@ pub(crate) fn build_lod_index<S: CopcPointSource>(
     let total_points = u32::try_from(source.len()).map_err(|_| {
         Error::InvalidInput("COPC writer supports at most u32::MAX points per file".into())
     })?;
-    let max_points_per_node = params.max_points_per_node.max(1) as usize;
+    if params.max_points_per_node == 0 {
+        return Err(Error::InvalidInput(
+            "max_points_per_node must be greater than zero".into(),
+        ));
+    }
+    let max_points_per_node = params.max_points_per_node as usize;
     let root_run = write_root_index_run(total_points, cancel)?;
     let mut order_file = new_index_tempfile("order")?;
     let mut order_offset = 0;
@@ -96,7 +99,7 @@ impl<S: CopcPointSource, W: Write> LodIndexBuilder<'_, S, W> {
         if run.count == 0 {
             return Ok(());
         }
-        if run.count <= self.max_points_per_node || key.level as u32 >= MAX_OCTREE_DEPTH {
+        if run.count <= self.max_points_per_node {
             let start = *self.order_offset;
             append_index_run_to_order(&run, self.order_writer, self.order_offset, self.cancel)?;
             self.nodes.push(LodNodeRange {
@@ -105,6 +108,12 @@ impl<S: CopcPointSource, W: Write> LodIndexBuilder<'_, S, W> {
                 count: run.count,
             });
             return Ok(());
+        }
+        if key.level as u32 >= MAX_OCTREE_DEPTH {
+            return Err(Error::InvalidInput(format!(
+                "octree node {key:?} still contains {} points at the maximum depth; increase max_points_per_node above {}",
+                run.count, self.max_points_per_node
+            )));
         }
 
         let mut children = partition_index_run(self.source, &run, bounds, self.cancel)?;
@@ -134,7 +143,7 @@ impl<S: CopcPointSource, W: Write> LodIndexBuilder<'_, S, W> {
             child_run.start += selected as u64 * INDEX_RECORD_BYTES;
             child_run.count -= selected;
             self.assign(
-                key.child(octant as u8),
+                key.child(octant as u8)?,
                 child_run,
                 bounds.octant(octant as u8),
             )?;
@@ -180,7 +189,7 @@ fn partition_index_run<S: CopcPointSource>(
         let index = reader
             .read_u32::<LittleEndian>()
             .map_err(|e| Error::io("read LOD partition index", e))?;
-        let (x, y, z) = source.xyz(index as usize);
+        let (x, y, z) = source.xyz(index as usize)?;
         let octant = child_octant(center, x, y, z);
         if writers[octant].is_none() {
             writers[octant] = Some(BufWriter::with_capacity(
@@ -190,7 +199,7 @@ fn partition_index_run<S: CopcPointSource>(
         }
         writers[octant]
             .as_mut()
-            .expect("partition writer exists")
+            .ok_or_else(|| Error::InvalidData("partition writer was not created".into()))?
             .write_u32::<LittleEndian>(index)
             .map_err(|e| Error::io("write LOD partition index", e))?;
         counts[octant] += 1;
@@ -241,7 +250,7 @@ fn append_lod_selection_to_order<W: Write>(
             }
             let index = readers[octant]
                 .as_mut()
-                .expect("partition reader exists")
+                .ok_or_else(|| Error::InvalidData("partition reader was not opened".into()))?
                 .read_u32::<LittleEndian>()
                 .map_err(|e| Error::io("read selected LOD index", e))?;
             append_index_to_order(order_writer, order_offset, index)?;
@@ -345,9 +354,9 @@ mod tests {
             self.points.len()
         }
 
-        fn xyz(&self, index: usize) -> (f64, f64, f64) {
+        fn xyz(&self, index: usize) -> Result<(f64, f64, f64)> {
             let point = &self.points[index];
-            (point.x, point.y, point.z)
+            Ok((point.x, point.y, point.z))
         }
 
         fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> Result<()> {
@@ -472,6 +481,34 @@ mod tests {
                 indices.len(),
             );
         }
+    }
+
+    #[test]
+    fn identical_points_fail_instead_of_creating_an_unbounded_leaf() {
+        let point = CopcPointFields {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+            return_number: 1,
+            number_of_returns: 1,
+            ..CopcPointFields::default()
+        };
+        let source = VecSource {
+            points: vec![point; 32],
+        };
+        let bounds = source_bounds(&source);
+        let (center, halfsize) = cube_from_bounds(&bounds);
+        let error = build_lod_index(
+            &source,
+            center,
+            halfsize,
+            &CopcWriterParams::new(1),
+            &NeverCancel,
+        )
+        .err()
+        .expect("identical points must exceed the depth cap");
+
+        assert!(error.to_string().contains("maximum depth"));
     }
 
     fn source_bounds(source: &VecSource) -> Bounds {

@@ -59,8 +59,8 @@ impl SpillWriter {
     pub fn push(&mut self, record: &LasPointRecord) -> Result<()> {
         let index = usize::try_from(self.count).unwrap_or(usize::MAX);
         validate_spill_record(record, index)?;
-        self.stats
-            .record(index, record.gps_time, record.return_number)?;
+        let mut next_stats = self.stats;
+        next_stats.record(index, record.gps_time, record.return_number)?;
         serialize_le(record, &self.layout, &mut self.scratch)
             .map_err(|e| Error::InvalidInput(format!("encode spill record: {e}")))?;
         let writer = self
@@ -74,7 +74,11 @@ impl SpillWriter {
             Some(bounds) => bounds.extend(record.x, record.y, record.z),
             None => self.bounds = Some(Bounds::point(record.x, record.y, record.z)),
         }
-        self.count += 1;
+        self.stats = next_stats;
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("spill record count exceeds u64 range".into()))?;
         Ok(())
     }
 
@@ -96,12 +100,12 @@ impl SpillWriter {
         file.as_file()
             .sync_all()
             .map_err(|e| Error::io("sync spill file", e))?;
+        let count = usize::try_from(self.count)
+            .map_err(|_| Error::InvalidInput("spill record count exceeds usize range".into()))?;
         let mmap_file = file
             .reopen()
             .map_err(|e| Error::io("open spill for mmap", e))?;
         let temp_path = file.into_temp_path();
-        let count = usize::try_from(self.count)
-            .map_err(|_| Error::InvalidInput("spill record count exceeds usize range".into()))?;
         let bounds = self.bounds.unwrap_or_else(|| Bounds::point(0.0, 0.0, 0.0));
         SpillReader::open(
             temp_path,
@@ -119,7 +123,7 @@ impl SpillWriter {
 pub struct SpillReader {
     #[cfg(test)]
     path: PathBuf,
-    mmap: Mmap,
+    mmap: Option<Mmap>,
     _file: File,
     _path: TempPath,
     layout: StreamingLayout,
@@ -142,17 +146,26 @@ impl SpillReader {
     ) -> Result<Self> {
         #[cfg(test)]
         let path = temp_path.to_path_buf();
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| Error::io("mmap spill file", e))?;
         let expected = record_width
             .checked_mul(count)
             .ok_or_else(|| Error::InvalidInput("spill size overflow".into()))?;
-        if mmap.len() != expected {
+        let actual = file
+            .metadata()
+            .map_err(|e| Error::io("stat spill file", e))?
+            .len();
+        let expected_u64 = u64::try_from(expected)
+            .map_err(|_| Error::InvalidInput("spill size exceeds u64 range".into()))?;
+        if actual != expected_u64 {
             return Err(Error::InvalidInput(format!(
                 "spill file is {} bytes, expected {}",
-                mmap.len(),
-                expected
+                actual, expected
             )));
         }
+        let mmap = if expected == 0 {
+            None
+        } else {
+            Some(unsafe { Mmap::map(&file) }.map_err(|e| Error::io("mmap spill file", e))?)
+        };
         Ok(Self {
             #[cfg(test)]
             path,
@@ -188,19 +201,34 @@ impl SpillReader {
     }
 
     #[inline]
-    fn record_bytes(&self, index: usize) -> &[u8] {
-        let start = index * self.record_width;
-        &self.mmap[start..start + self.record_width]
+    fn record_bytes(&self, index: usize) -> Result<&[u8]> {
+        let start = index
+            .checked_mul(self.record_width)
+            .ok_or_else(|| Error::InvalidData("spill record offset overflow".into()))?;
+        let end = start
+            .checked_add(self.record_width)
+            .ok_or_else(|| Error::InvalidData("spill record end overflow".into()))?;
+        let mmap = self
+            .mmap
+            .as_ref()
+            .ok_or_else(|| Error::InvalidData("non-empty spill has no memory map".into()))?;
+        mmap.get(start..end)
+            .ok_or_else(|| Error::InvalidData("spill record range exceeds memory map".into()))
     }
 
     #[inline]
-    pub fn xyz_at(&self, index: usize) -> (f64, f64, f64) {
-        debug_assert!(index < self.count);
-        let bytes = self.record_bytes(index);
+    pub fn xyz_at(&self, index: usize) -> Result<(f64, f64, f64)> {
+        if index >= self.count {
+            return Err(Error::InvalidInput(format!(
+                "spill index {index} out of range (len {})",
+                self.count
+            )));
+        }
+        let bytes = self.record_bytes(index)?;
         let x = f64::from_le_bytes(bytes[0..8].try_into().expect("spill x width"));
         let y = f64::from_le_bytes(bytes[8..16].try_into().expect("spill y width"));
         let z = f64::from_le_bytes(bytes[16..24].try_into().expect("spill z width"));
-        (x, y, z)
+        Ok((x, y, z))
     }
 
     pub fn record_at(&self, index: usize) -> Result<LasPointRecord> {
@@ -217,7 +245,7 @@ impl SpillReader {
                 self.count
             )));
         }
-        deserialize_le_into(self.record_bytes(index), &self.layout, out)
+        deserialize_le_into(self.record_bytes(index)?, &self.layout, out)
             .map_err(|e| Error::InvalidData(format!("decode spill record {index}: {e}")))
     }
 }
@@ -285,7 +313,10 @@ mod tests {
         assert_eq!(reader.len(), 256);
         for (i, original) in originals.iter().enumerate() {
             assert_eq!(reader.record_at(i).unwrap(), *original);
-            assert_eq!(reader.xyz_at(i), (original.x, original.y, original.z));
+            assert_eq!(
+                reader.xyz_at(i).unwrap(),
+                (original.x, original.y, original.z)
+            );
         }
         let bounds = reader.bounds();
         assert_eq!(bounds.min, (0.0, -573.75, 0.0));
@@ -313,6 +344,18 @@ mod tests {
         assert!(path.exists());
         drop(reader);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn empty_spill_finalizes_without_mapping_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SpillWriter::create(dir.path(), layout_with_color()).unwrap();
+
+        let reader = writer.finalize().unwrap();
+
+        assert!(reader.is_empty());
+        assert_eq!(0, reader.len());
+        assert!(reader.record_at(0).is_err());
     }
 
     #[cfg(unix)]

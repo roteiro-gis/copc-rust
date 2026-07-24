@@ -48,7 +48,7 @@ pub(crate) fn plan_hierarchy_pages(entries: &[Entry], key: VoxelKey) -> Result<H
         }
         let mut matched = false;
         for (octant, child_entries) in child_entries.iter_mut().enumerate() {
-            let child_key = key.child(octant as u8);
+            let child_key = key.child(octant as u8)?;
             if key_contains(child_key, entry.key) {
                 child_entries.push(entry);
                 matched = true;
@@ -73,7 +73,7 @@ pub(crate) fn plan_hierarchy_pages(entries: &[Entry], key: VoxelKey) -> Result<H
         }
         items.push(HierarchyPageItem::Child(Box::new(plan_hierarchy_pages(
             &child_entries,
-            key.child(octant as u8),
+            key.child(octant as u8)?,
         )?)));
     }
     if items.len() > HIERARCHY_PAGE_MAX_ENTRIES {

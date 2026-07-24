@@ -9,7 +9,6 @@ use copc_reader::{BoundsSelection, CopcFile, CopcReader, LodSelection};
 use copc_writer::{
     write_source, CopcPointFields, CopcPointSource, CopcWriteMetadata, CopcWriterParams,
 };
-use las::Read as _;
 
 struct VecSource {
     points: Vec<CopcPointFields>,
@@ -20,9 +19,9 @@ impl CopcPointSource for VecSource {
         self.points.len()
     }
 
-    fn xyz(&self, index: usize) -> (f64, f64, f64) {
+    fn xyz(&self, index: usize) -> copc_core::Result<(f64, f64, f64)> {
         let p = &self.points[index];
-        (p.x, p.y, p.z)
+        Ok((p.x, p.y, p.z))
     }
 
     fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {
@@ -100,7 +99,8 @@ fn parallel_write_round_trips_multi_chunk_cloud() {
     // LAZ reader doing sequential decompression.
     let mut las_reader = las::Reader::from_path(&path).unwrap();
     assert_eq!(source.len() as u64, las_reader.header().number_of_points());
-    let mut las_gps: Vec<f64> = las_reader
+    let point_data = las_reader.read_all().unwrap();
+    let mut las_gps: Vec<f64> = point_data
         .points()
         .map(|point| point.unwrap().gps_time.unwrap())
         .collect();
