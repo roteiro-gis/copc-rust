@@ -43,9 +43,9 @@ impl Bounds {
 
     pub fn center(self) -> (f64, f64, f64) {
         (
-            (self.min.0 + self.max.0) * 0.5,
-            (self.min.1 + self.max.1) * 0.5,
-            (self.min.2 + self.max.2) * 0.5,
+            self.min.0 * 0.5 + self.max.0 * 0.5,
+            self.min.1 * 0.5 + self.max.1 * 0.5,
+            self.min.2 * 0.5 + self.max.2 * 0.5,
         )
     }
 
@@ -88,5 +88,24 @@ impl Bounds {
             && y <= self.max.1
             && self.min.2 <= z
             && z <= self.max.2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn center_does_not_overflow_for_large_finite_bounds() {
+        let bounds = Bounds::new(
+            (f64::MAX / 2.0, -f64::MAX, -10.0),
+            (f64::MAX, f64::MAX, 10.0),
+        );
+
+        let center = bounds.center();
+
+        assert!(center.0.is_finite());
+        assert_eq!(0.0, center.1);
+        assert_eq!(0.0, center.2);
     }
 }

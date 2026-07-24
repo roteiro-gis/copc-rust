@@ -37,7 +37,8 @@ pub struct CopcPointFields {
 /// Abstract point-data source for COPC emission.
 pub trait CopcPointSource {
     fn len(&self) -> usize;
-    fn xyz(&self, index: usize) -> (f64, f64, f64);
+    /// Return the coordinates used for octree assignment.
+    fn xyz(&self, index: usize) -> Result<(f64, f64, f64)>;
     /// Fill `out` with the fields of the point at `index`, reusing `out`'s
     /// allocations (notably `extra_bytes`) across calls.
     fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> Result<()>;
@@ -153,8 +154,14 @@ impl CopcPointSource for ColumnBatchSource<'_> {
     }
 
     #[inline]
-    fn xyz(&self, index: usize) -> (f64, f64, f64) {
-        (self.x[index], self.y[index], self.z[index])
+    fn xyz(&self, index: usize) -> Result<(f64, f64, f64)> {
+        if index >= self.len() {
+            return Err(Error::InvalidInput(format!(
+                "column batch index {index} out of range (len {})",
+                self.len()
+            )));
+        }
+        Ok((self.x[index], self.y[index], self.z[index]))
     }
 
     fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> Result<()> {
@@ -358,7 +365,7 @@ impl CopcPointSource for SpillSource<'_> {
     }
 
     #[inline]
-    fn xyz(&self, index: usize) -> (f64, f64, f64) {
+    fn xyz(&self, index: usize) -> Result<(f64, f64, f64)> {
         self.reader.xyz_at(index)
     }
 

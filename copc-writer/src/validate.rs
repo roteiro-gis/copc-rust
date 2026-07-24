@@ -1,6 +1,8 @@
 //! Input validation and per-point statistics for COPC writes.
 
-use copc_core::{Bounds, CancelCheck, Error, LasPointRecord, Result, StreamingLayout};
+use copc_core::{
+    Bounds, CancelCheck, Error, LasPointRecord, Result, StreamingLayout, MAX_VLR_COUNT,
+};
 
 use crate::metadata::{has_wkt_crs_record, is_geotiff_crs_vlr, normalized_crs_wkt_override};
 use crate::source::{CopcPointFields, CopcPointSource};
@@ -62,6 +64,12 @@ pub(crate) fn validate_las_conversion_supported(
     source_evlrs: &[las::Vlr],
     crs_wkt_override: Option<&str>,
 ) -> Result<()> {
+    if header.vlrs().len() > MAX_VLR_COUNT as usize {
+        return Err(Error::InvalidData(format!(
+            "source VLR count {} exceeds max supported {MAX_VLR_COUNT}",
+            header.vlrs().len()
+        )));
+    }
     let mut unsupported = Vec::new();
     let format = header.point_format();
     if format.has_nir {
@@ -137,13 +145,19 @@ pub(crate) fn validate_source_points<S: CopcPointSource>(
         if index % CANCEL_POLL_STRIDE == 0 {
             cancel.check()?;
         }
-        let (x, y, z) = source.xyz(index);
+        let (x, y, z) = source.xyz(index)?;
         validate_xyz_finite(index, x, y, z)?;
         validate_xyz_in_bounds(index, x, y, z, bounds)?;
         quantize_xyz(index, x, y, z, scale, offset)?;
 
         source.fields_into(index, &mut fields)?;
         validate_xyz_finite(index, fields.x, fields.y, fields.z)?;
+        if (fields.x, fields.y, fields.z) != (x, y, z) {
+            return Err(Error::InvalidInput(format!(
+                "point {index} xyz() returned ({x}, {y}, {z}) but fields_into() returned ({}, {}, {})",
+                fields.x, fields.y, fields.z
+            )));
+        }
         validate_xyz_in_bounds(index, fields.x, fields.y, fields.z, bounds)?;
         quantize_xyz(index, fields.x, fields.y, fields.z, scale, offset)?;
         validate_scan_angle(index, fields.scan_angle)?;

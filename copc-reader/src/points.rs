@@ -206,7 +206,7 @@ impl<R: Read + Seek + Send> CopcReader<R> {
                         let mut chunk_columns = selected_column_builders(
                             point_format,
                             selection.clone(),
-                            *points_in_chunk,
+                            (*points_in_chunk).min(MAX_INITIAL_COLUMN_RESERVE_POINTS),
                         )?;
                         let accepted = decoder.decode_into(
                             chunk_bytes,
@@ -390,8 +390,19 @@ fn merge_columns(
     dst: &mut [(ColumnSpec, ColumnData)],
     src: Vec<(ColumnSpec, ColumnData)>,
 ) -> Result<()> {
+    if dst.len() != src.len() {
+        return Err(Error::InvalidData(format!(
+            "chunk produced {} columns, expected {}",
+            src.len(),
+            dst.len()
+        )));
+    }
     for ((dst_spec, dst_data), (src_spec, src_data)) in dst.iter_mut().zip(src) {
-        debug_assert_eq!(*dst_spec, src_spec);
+        if *dst_spec != src_spec {
+            return Err(Error::InvalidData(format!(
+                "chunk column spec mismatch: found {src_spec:?}, expected {dst_spec:?}"
+            )));
+        }
         match (dst_data, src_data) {
             (ColumnData::F64(dst), ColumnData::F64(src)) => dst.extend_from_slice(&src),
             (ColumnData::F32(dst), ColumnData::F32(src)) => dst.extend_from_slice(&src),
@@ -743,7 +754,13 @@ impl<'a, R: Read + Seek + Send> PointIter<'a, R> {
             if entry.point_count <= 0 {
                 continue;
             }
-            self.decoder.seek_to_chunk(entry.offset)?;
+            let byte_size = u64::try_from(entry.byte_size).map_err(|_| {
+                Error::InvalidData(format!(
+                    "negative byte size {} for {:?}",
+                    entry.byte_size, entry.key
+                ))
+            })?;
+            self.decoder.seek_to_chunk(entry.offset, byte_size)?;
             self.current_chunk_points_left = usize::try_from(entry.point_count).map_err(|_| {
                 Error::InvalidData(format!(
                     "negative point count {} for {:?}",
@@ -864,13 +881,13 @@ impl<'a, R: Read + Seek + Send> QuerySetup<'a, R> {
 
 struct ChunkLazDecoder<'a, R: Read + Seek + Send> {
     laz_vlr: LazVlr,
-    decompressor: LayeredPointRecordDecompressor<'a, &'a mut R>,
+    decompressor: LayeredPointRecordDecompressor<'a, ChunkReadWindow<'a, R>>,
     record_size: usize,
 }
 
 impl<'a, R: Read + Seek + Send> ChunkLazDecoder<'a, R> {
     fn new(source: &'a mut R, laz_vlr: LazVlr) -> Result<Self> {
-        let mut decompressor = LayeredPointRecordDecompressor::new(source);
+        let mut decompressor = LayeredPointRecordDecompressor::new(ChunkReadWindow::new(source));
         let record_size = configure_layered_decompressor(&mut decompressor, &laz_vlr)?;
         Ok(Self {
             laz_vlr,
@@ -883,11 +900,8 @@ impl<'a, R: Read + Seek + Send> ChunkLazDecoder<'a, R> {
         self.record_size
     }
 
-    fn seek_to_chunk(&mut self, offset: u64) -> Result<()> {
-        self.decompressor
-            .get_mut()
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| Error::io("seek COPC point chunk", e))?;
+    fn seek_to_chunk(&mut self, offset: u64, byte_size: u64) -> Result<()> {
+        self.decompressor.get_mut().set_range(offset, byte_size)?;
         self.decompressor.reset();
         self.record_size = configure_layered_decompressor(&mut self.decompressor, &self.laz_vlr)?;
         Ok(())
@@ -897,6 +911,78 @@ impl<'a, R: Read + Seek + Send> ChunkLazDecoder<'a, R> {
         self.decompressor
             .decompress_next(out)
             .map_err(|e| Error::io("decompress COPC point", e))
+    }
+}
+
+/// Restricts the streaming LAZ decoder to the hierarchy entry's declared
+/// compressed byte range. Without this window, malformed chunk metadata can
+/// make the decoder consume bytes from the following chunk or hierarchy.
+struct ChunkReadWindow<'a, R> {
+    source: &'a mut R,
+    start: u64,
+    end: u64,
+    position: u64,
+}
+
+impl<'a, R: Read + Seek> ChunkReadWindow<'a, R> {
+    fn new(source: &'a mut R) -> Self {
+        Self {
+            source,
+            start: 0,
+            end: 0,
+            position: 0,
+        }
+    }
+
+    fn set_range(&mut self, start: u64, byte_size: u64) -> Result<()> {
+        let end = start
+            .checked_add(byte_size)
+            .ok_or_else(|| Error::InvalidData("COPC point chunk range overflows u64".into()))?;
+        self.source
+            .seek(SeekFrom::Start(start))
+            .map_err(|e| Error::io("seek COPC point chunk", e))?;
+        self.start = start;
+        self.end = end;
+        self.position = start;
+        Ok(())
+    }
+}
+
+impl<R: Read + Seek> Read for ChunkReadWindow<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.end.saturating_sub(self.position);
+        if remaining == 0 {
+            return Ok(0);
+        }
+        let allowed = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let read = self.source.read(&mut buf[..allowed])?;
+        self.position = self
+            .position
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("chunk read position overflow"))?;
+        Ok(read)
+    }
+}
+
+impl<R: Read + Seek> Seek for ChunkReadWindow<'_, R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            SeekFrom::End(delta) => self.end.checked_add_signed(delta),
+        }
+        .filter(|target| (self.start..=self.end).contains(target))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek outside COPC point chunk",
+            )
+        })?;
+        self.source.seek(SeekFrom::Start(target))?;
+        self.position = target;
+        Ok(target)
     }
 }
 
@@ -928,6 +1014,7 @@ pub(crate) fn select_point_chunks_from<'a, I>(
 where
     I: IntoIterator<Item = &'a Entry>,
 {
+    validate_query(query)?;
     let (level_min, level_max) = level_range(query.lod, info)?;
     let query_bounds = match query.bounds {
         BoundsSelection::All => None,
@@ -958,6 +1045,37 @@ where
     }
     chunks.sort_by_key(|entry| (entry.offset, entry.key));
     Ok(chunks)
+}
+
+pub(crate) fn validate_query(query: PointQuery) -> Result<()> {
+    if let BoundsSelection::Within(bounds) = query.bounds {
+        for (name, value) in [
+            ("min x", bounds.min.0),
+            ("min y", bounds.min.1),
+            ("min z", bounds.min.2),
+            ("max x", bounds.max.0),
+            ("max y", bounds.max.1),
+            ("max z", bounds.max.2),
+        ] {
+            if !value.is_finite() {
+                return Err(Error::InvalidInput(format!(
+                    "query bounds {name} must be finite, got {value}"
+                )));
+            }
+        }
+        for (axis, min, max) in [
+            ("x", bounds.min.0, bounds.max.0),
+            ("y", bounds.min.1, bounds.max.1),
+            ("z", bounds.min.2, bounds.max.2),
+        ] {
+            if min > max {
+                return Err(Error::InvalidInput(format!(
+                    "query bounds {axis} minimum {min} exceeds maximum {max}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn level_range(selection: LodSelection, info: &CopcInfo) -> Result<(i32, i32)> {
@@ -1024,12 +1142,7 @@ pub(crate) fn total_candidate_points(entries: &[Entry]) -> Result<usize> {
 }
 
 pub(crate) fn voxel_bounds(key: copc_core::VoxelKey, info: &CopcInfo) -> Result<Bounds> {
-    if key.level < 0 || key.x < 0 || key.y < 0 || key.z < 0 {
-        return Err(Error::InvalidData(format!(
-            "invalid negative voxel key {:?}",
-            key
-        )));
-    }
+    key.validate()?;
     let side = (info.halfsize * 2.0) / 2.0_f64.powi(key.level);
     let root_min = (
         info.center.0 - info.halfsize,

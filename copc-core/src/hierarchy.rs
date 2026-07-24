@@ -21,13 +21,48 @@ impl VoxelKey {
         }
     }
 
-    pub fn child(self, octant: u8) -> Self {
-        Self {
-            level: self.level + 1,
-            x: (self.x << 1) | i32::from(octant & 1),
-            y: (self.y << 1) | i32::from((octant >> 1) & 1),
-            z: (self.z << 1) | i32::from((octant >> 2) & 1),
+    pub fn child(self, octant: u8) -> Result<Self> {
+        self.validate()?;
+        if octant > 7 {
+            return Err(Error::InvalidInput(format!(
+                "octant must be in 0..=7, got {octant}"
+            )));
         }
+        let level = self
+            .level
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("voxel level overflow".into()))?;
+        let child_axis = |axis: i32, bit: u8| {
+            axis.checked_mul(2)
+                .and_then(|axis| axis.checked_add(i32::from(bit)))
+                .ok_or_else(|| Error::InvalidInput("voxel axis overflow".into()))
+        };
+        let child = Self {
+            level,
+            x: child_axis(self.x, octant & 1)?,
+            y: child_axis(self.y, (octant >> 1) & 1)?,
+            z: child_axis(self.z, (octant >> 2) & 1)?,
+        };
+        child.validate()?;
+        Ok(child)
+    }
+
+    /// Validate this key against the EPT/COPC octree coordinate rules.
+    pub fn validate(self) -> Result<()> {
+        if self.level < 0 || self.x < 0 || self.y < 0 || self.z < 0 {
+            return Err(Error::InvalidData(format!(
+                "invalid negative COPC voxel key {self:?}"
+            )));
+        }
+        if self.level < 31 {
+            let axis_limit = 1i32 << self.level;
+            if self.x >= axis_limit || self.y >= axis_limit || self.z >= axis_limit {
+                return Err(Error::InvalidData(format!(
+                    "COPC voxel key {self:?} has an axis outside 0..{axis_limit}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -49,6 +84,38 @@ pub enum EntryAvailability {
 }
 
 impl Entry {
+    /// Validate invariants that do not depend on the containing file.
+    pub fn validate(self) -> Result<()> {
+        self.key.validate()?;
+        match self.availability()? {
+            EntryAvailability::Empty => {
+                if self.offset != 0 || self.byte_size != 0 {
+                    return Err(Error::InvalidData(format!(
+                        "empty hierarchy entry {:?} must have zero offset and byte size",
+                        self.key
+                    )));
+                }
+            }
+            EntryAvailability::PointData { .. } => {
+                if self.byte_size <= 0 {
+                    return Err(Error::InvalidData(format!(
+                        "point data entry {:?} has invalid byte size {}",
+                        self.key, self.byte_size
+                    )));
+                }
+            }
+            EntryAvailability::ChildPage => {
+                if self.byte_size <= 0 {
+                    return Err(Error::InvalidData(format!(
+                        "child hierarchy page {:?} has invalid byte size {}",
+                        self.key, self.byte_size
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn availability(self) -> Result<EntryAvailability> {
         match self.point_count {
             -1 => Ok(EntryAvailability::ChildPage),
@@ -82,6 +149,7 @@ impl Entry {
     }
 
     pub fn write_le(self, dst: &mut [u8]) -> Result<()> {
+        self.validate()?;
         if dst.len() != HIERARCHY_ENTRY_BYTES {
             return Err(Error::InvalidInput(format!(
                 "hierarchy entry destination is {} bytes, expected {}",
@@ -107,7 +175,7 @@ impl Entry {
                 HIERARCHY_ENTRY_BYTES
             )));
         }
-        Ok(Self {
+        let entry = Self {
             key: VoxelKey {
                 level: i32::from_le_bytes(src[0..4].try_into().expect("level width")),
                 x: i32::from_le_bytes(src[4..8].try_into().expect("x width")),
@@ -117,7 +185,9 @@ impl Entry {
             offset: u64::from_le_bytes(src[16..24].try_into().expect("offset width")),
             byte_size: i32::from_le_bytes(src[24..28].try_into().expect("byte_size width")),
             point_count: i32::from_le_bytes(src[28..32].try_into().expect("point_count width")),
-        })
+        };
+        entry.validate()?;
+        Ok(entry)
     }
 }
 
@@ -156,7 +226,12 @@ impl HierarchyPage {
     }
 
     pub fn write_le_bytes(&self) -> Result<Vec<u8>> {
-        let mut out = vec![0u8; self.entries.len() * HIERARCHY_ENTRY_BYTES];
+        let byte_len = self
+            .entries
+            .len()
+            .checked_mul(HIERARCHY_ENTRY_BYTES)
+            .ok_or_else(|| Error::InvalidInput("hierarchy page size overflows usize".into()))?;
+        let mut out = vec![0u8; byte_len];
         for (entry, chunk) in self
             .entries
             .iter()
@@ -193,7 +268,7 @@ mod tests {
 
     #[test]
     fn voxel_child_maps_octant_bits() {
-        let child = VoxelKey::root().child(0b101);
+        let child = VoxelKey::root().child(0b101).unwrap();
         assert_eq!(
             child,
             VoxelKey {
@@ -203,6 +278,36 @@ mod tests {
                 z: 1,
             }
         );
+        assert!(VoxelKey::root().child(8).is_err());
+    }
+
+    #[test]
+    fn voxel_key_validation_rejects_invalid_axes() {
+        VoxelKey::root().validate().unwrap();
+        VoxelKey {
+            level: 3,
+            x: 7,
+            y: 7,
+            z: 7,
+        }
+        .validate()
+        .unwrap();
+        assert!(VoxelKey {
+            level: 3,
+            x: 8,
+            y: 0,
+            z: 0,
+        }
+        .validate()
+        .is_err());
+        assert!(VoxelKey {
+            level: -1,
+            x: 0,
+            y: 0,
+            z: 0,
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

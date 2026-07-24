@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use crate::{Error, Result, HIERARCHY_ENTRY_BYTES};
 
 pub const COPC_INFO_BYTES: usize = 160;
 
@@ -16,14 +16,19 @@ pub struct CopcInfo {
 
 impl CopcInfo {
     pub fn from_le_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < COPC_INFO_BYTES {
+        if bytes.len() != COPC_INFO_BYTES {
             return Err(Error::InvalidData(format!(
-                "COPC info payload is {} bytes, expected at least {}",
+                "COPC info payload is {} bytes, expected exactly {}",
                 bytes.len(),
                 COPC_INFO_BYTES
             )));
         }
-        Ok(Self {
+        if bytes[72..].iter().any(|byte| *byte != 0) {
+            return Err(Error::InvalidData(
+                "COPC info reserved bytes must all be zero".into(),
+            ));
+        }
+        let info = Self {
             center: (read_f64(bytes, 0), read_f64(bytes, 8), read_f64(bytes, 16)),
             halfsize: read_f64(bytes, 24),
             spacing: read_f64(bytes, 32),
@@ -31,10 +36,14 @@ impl CopcInfo {
             root_hier_size: read_u64(bytes, 48),
             gpstime_min: read_f64(bytes, 56),
             gpstime_max: read_f64(bytes, 64),
-        })
+        };
+        info.validate()?;
+        Ok(info)
     }
 
-    pub fn write_le_bytes(self) -> [u8; COPC_INFO_BYTES] {
+    /// Validate and serialize the exact 160-byte COPC info payload.
+    pub fn write_le_bytes(self) -> Result<[u8; COPC_INFO_BYTES]> {
+        self.validate()?;
         let mut out = [0u8; COPC_INFO_BYTES];
         write_f64(&mut out, 0, self.center.0);
         write_f64(&mut out, 8, self.center.1);
@@ -45,7 +54,57 @@ impl CopcInfo {
         write_u64(&mut out, 48, self.root_hier_size);
         write_f64(&mut out, 56, self.gpstime_min);
         write_f64(&mut out, 64, self.gpstime_max);
-        out
+        Ok(out)
+    }
+
+    pub fn validate(self) -> Result<()> {
+        for (name, value) in [
+            ("center x", self.center.0),
+            ("center y", self.center.1),
+            ("center z", self.center.2),
+        ] {
+            if !value.is_finite() {
+                return Err(Error::InvalidData(format!(
+                    "COPC info {name} must be finite, got {value}"
+                )));
+            }
+        }
+        for (name, value) in [("halfsize", self.halfsize), ("spacing", self.spacing)] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(Error::InvalidData(format!(
+                    "COPC info {name} must be finite and positive, got {value}"
+                )));
+            }
+        }
+        if self.root_hier_offset == 0 {
+            return Err(Error::InvalidData(
+                "COPC root hierarchy offset must be non-zero".into(),
+            ));
+        }
+        if self.root_hier_size == 0 {
+            return Err(Error::InvalidData(
+                "COPC root hierarchy page is empty".into(),
+            ));
+        }
+        if self.root_hier_size % HIERARCHY_ENTRY_BYTES as u64 != 0 {
+            return Err(Error::InvalidData(format!(
+                "COPC root hierarchy size {} is not a multiple of {HIERARCHY_ENTRY_BYTES}",
+                self.root_hier_size
+            )));
+        }
+        if !self.gpstime_min.is_finite() || !self.gpstime_max.is_finite() {
+            return Err(Error::InvalidData(format!(
+                "COPC GPS time range must be finite, got {}..{}",
+                self.gpstime_min, self.gpstime_max
+            )));
+        }
+        if self.gpstime_min > self.gpstime_max {
+            return Err(Error::InvalidData(format!(
+                "COPC GPS time minimum {} exceeds maximum {}",
+                self.gpstime_min, self.gpstime_max
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -89,8 +148,32 @@ mod tests {
             gpstime_max: 20.0,
         };
         assert_eq!(
-            CopcInfo::from_le_bytes(&info.write_le_bytes()).unwrap(),
+            CopcInfo::from_le_bytes(&info.write_le_bytes().unwrap()).unwrap(),
             info
         );
+    }
+
+    #[test]
+    fn copc_info_rejects_nonzero_reserved_bytes_and_invalid_numbers() {
+        let info = CopcInfo {
+            center: (1.0, 2.0, 3.0),
+            halfsize: 4.0,
+            spacing: 0.25,
+            root_hier_offset: 100,
+            root_hier_size: 32,
+            gpstime_min: 10.0,
+            gpstime_max: 20.0,
+        };
+        let mut bytes = info.write_le_bytes().unwrap();
+        bytes[159] = 1;
+        assert!(CopcInfo::from_le_bytes(&bytes).is_err());
+
+        let mut bytes = info.write_le_bytes().unwrap();
+        write_f64(&mut bytes, 24, f64::NAN);
+        assert!(CopcInfo::from_le_bytes(&bytes).is_err());
+
+        let mut bytes = info.write_le_bytes().unwrap();
+        write_f64(&mut bytes, 56, 21.0);
+        assert!(CopcInfo::from_le_bytes(&bytes).is_err());
     }
 }

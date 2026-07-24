@@ -2,9 +2,10 @@
 //! classification and source-metadata extraction.
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use byteorder::{LittleEndian, ReadBytesExt};
 use copc_core::{Error, Result, MAX_EVLR_COUNT};
 use las::raw;
 
@@ -20,6 +21,8 @@ const GEOTIFF_ASCII_PARAMS_RECORD_ID: u16 = 34737;
 const LASF_SPEC_USER_ID: &str = "LASF_Spec";
 const EXTRA_BYTES_RECORD_ID: u16 = 4;
 pub(crate) const WKT_GLOBAL_ENCODING_BIT: u16 = 16;
+const LAS_EVLR_HEADER_BYTES: u64 = 60;
+const MAX_SOURCE_EVLR_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Caller-supplied metadata for generated COPC output.
 ///
@@ -238,28 +241,100 @@ impl OutputLasMetadata {
 
 pub(crate) fn read_all_source_evlrs(path: &Path) -> Result<Vec<las::Vlr>> {
     let mut file = File::open(path).map_err(|e| Error::io("open source LAS/LAZ", e))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| Error::io("stat source LAS/LAZ", e))?
+        .len();
     let raw_header =
         raw::Header::read_from(&mut file).map_err(|e| Error::Las(format!("source header: {e}")))?;
     let Some(evlr_header) = raw_header.evlr else {
         return Ok(Vec::new());
     };
 
-    file.seek(SeekFrom::Start(evlr_header.start_of_first_evlr))
-        .map_err(|e| Error::io("seek source EVLRs", e))?;
     if evlr_header.number_of_evlrs > MAX_EVLR_COUNT {
         return Err(Error::InvalidData(format!(
             "source EVLR count {} exceeds max supported {MAX_EVLR_COUNT}",
             evlr_header.number_of_evlrs
         )));
     }
+    if evlr_header.number_of_evlrs == 0 {
+        return Ok(Vec::new());
+    }
+    if evlr_header.start_of_first_evlr == 0 || evlr_header.start_of_first_evlr > file_len {
+        return Err(Error::InvalidData(format!(
+            "source first EVLR offset {} is outside file length {file_len}",
+            evlr_header.start_of_first_evlr
+        )));
+    }
+    file.seek(SeekFrom::Start(evlr_header.start_of_first_evlr))
+        .map_err(|e| Error::io("seek source EVLRs", e))?;
     let evlr_count = usize::try_from(evlr_header.number_of_evlrs)
         .map_err(|_| Error::InvalidInput("source EVLR count overflows usize".into()))?;
     let mut evlrs = Vec::with_capacity(evlr_count);
+    let mut total_data_bytes = 0u64;
     for index in 0..evlr_header.number_of_evlrs {
-        let evlr = raw::Vlr::read_from(&mut file, true)
-            .map(las::Vlr::new)
-            .map_err(|e| Error::Las(format!("source EVLR {index}: {e}")))?;
-        evlrs.push(evlr);
+        let header_start = file
+            .stream_position()
+            .map_err(|e| Error::io("record source EVLR offset", e))?;
+        let data_start = header_start
+            .checked_add(LAS_EVLR_HEADER_BYTES)
+            .ok_or_else(|| Error::InvalidData("source EVLR header range overflows u64".into()))?;
+        if data_start > file_len {
+            return Err(Error::InvalidData(format!(
+                "source EVLR {index} header exceeds file length {file_len}"
+            )));
+        }
+        let reserved = file
+            .read_u16::<LittleEndian>()
+            .map_err(|e| Error::io("read source EVLR reserved", e))?;
+        let mut user_id = [0u8; 16];
+        file.read_exact(&mut user_id)
+            .map_err(|e| Error::io("read source EVLR user id", e))?;
+        let record_id = file
+            .read_u16::<LittleEndian>()
+            .map_err(|e| Error::io("read source EVLR record id", e))?;
+        let data_len = file
+            .read_u64::<LittleEndian>()
+            .map_err(|e| Error::io("read source EVLR length", e))?;
+        let mut description = [0u8; 32];
+        file.read_exact(&mut description)
+            .map_err(|e| Error::io("read source EVLR description", e))?;
+
+        total_data_bytes = total_data_bytes
+            .checked_add(data_len)
+            .ok_or_else(|| Error::InvalidData("source EVLR byte total overflows u64".into()))?;
+        if total_data_bytes > MAX_SOURCE_EVLR_TOTAL_BYTES {
+            return Err(Error::InvalidData(format!(
+                "source EVLR data totals {total_data_bytes} bytes, max supported is {MAX_SOURCE_EVLR_TOTAL_BYTES}"
+            )));
+        }
+        let data_end = data_start
+            .checked_add(data_len)
+            .ok_or_else(|| Error::InvalidData("source EVLR data range overflows u64".into()))?;
+        if data_end > file_len {
+            return Err(Error::InvalidData(format!(
+                "source EVLR {index} data range {data_start}..{data_end} exceeds file length {file_len}"
+            )));
+        }
+        let data_len = usize::try_from(data_len)
+            .map_err(|_| Error::InvalidData("source EVLR length exceeds usize".into()))?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(data_len).map_err(|error| {
+            Error::InvalidData(format!(
+                "cannot allocate {data_len} bytes for source EVLR {index}: {error}"
+            ))
+        })?;
+        data.resize(data_len, 0);
+        file.read_exact(&mut data)
+            .map_err(|e| Error::io("read source EVLR data", e))?;
+        evlrs.push(las::Vlr::new(raw::Vlr {
+            reserved,
+            user_id,
+            record_id,
+            record_length_after_header: raw::vlr::RecordLength::Evlr(data_len as u64),
+            description,
+            data,
+        }));
     }
     Ok(evlrs)
 }

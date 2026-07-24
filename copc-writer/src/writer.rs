@@ -7,10 +7,11 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use copc_core::{
     Bounds, CancelCheck, CopcInfo, Entry, Error, LasPointRecord, NeverCancel, Result,
-    StreamingLayout, VoxelKey,
+    StreamingLayout, VoxelKey, MAX_EVLR_COUNT, MAX_VLR_COUNT,
 };
-use las::{point::Format as LasFormat, Read as _};
+use las::point::Format as LasFormat;
 use laz::{LasZipCompressor, LazVlrBuilder};
+use tempfile::NamedTempFile;
 
 use crate::hierarchy_pages::{
     assign_hierarchy_page_offsets, plan_hierarchy_pages, write_hierarchy_page_tree,
@@ -34,6 +35,7 @@ use crate::CANCEL_POLL_STRIDE;
 
 const LAS_INPUT_BUFFER_BYTES: usize = 1024 * 1024;
 const COPC_OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
+const LAS_POINT_BATCH_SIZE: u64 = 64 * 1024;
 
 /// Tuning parameters for COPC writes.
 #[derive(Debug, Clone, Copy)]
@@ -179,12 +181,27 @@ fn convert_las_to_copc_streaming_inner(
         OutputLasMetadata::from_las_header(reader.header(), &source_evlrs, crs_wkt_override);
     let layout = StreamingLayout::from_las_header(reader.header());
     let mut spill = SpillWriter::create(spill_dir, layout)?;
-    for (index, result) in reader.points().enumerate() {
-        if index % CANCEL_POLL_STRIDE == 0 {
-            cancel.check()?;
+    let mut point_data = las::PointDataBuilder::new()
+        .for_header(reader.header())
+        .build();
+    let mut index = 0usize;
+    loop {
+        let count = reader
+            .fill_points(LAS_POINT_BATCH_SIZE, &mut point_data)
+            .map_err(|e| Error::Las(e.to_string()))?;
+        if count == 0 {
+            break;
         }
-        let point = result.map_err(|e| Error::Las(e.to_string()))?;
-        spill.push(&LasPointRecord::from_las_point(&point))?;
+        for result in point_data.points() {
+            if index % CANCEL_POLL_STRIDE == 0 {
+                cancel.check()?;
+            }
+            let point = result.map_err(|e| Error::Las(e.to_string()))?;
+            spill.push(&LasPointRecord::from_las_point(&point))?;
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidInput("source point count exceeds usize".into()))?;
+        }
     }
     cancel.check()?;
     let reader = spill.finalize()?;
@@ -199,6 +216,11 @@ fn write_copc_from_spill(
     metadata: &OutputLasMetadata,
 ) -> Result<()> {
     cancel.check()?;
+    if params.max_points_per_node == 0 {
+        return Err(Error::InvalidInput(
+            "max_points_per_node must be greater than zero".into(),
+        ));
+    }
     validate_streaming_layout_supported(reader.layout())?;
     if reader.is_empty() {
         return Err(Error::InvalidInput(
@@ -233,12 +255,24 @@ fn write_copc_inner<S: CopcPointSource>(
     intake_stats: Option<PointStats>,
 ) -> Result<()> {
     cancel.check()?;
+    if params.max_points_per_node == 0 {
+        return Err(Error::InvalidInput(
+            "max_points_per_node must be greater than zero".into(),
+        ));
+    }
     let point_format_id = if has_color { 7u8 } else { 6u8 };
     let mut point_format =
         LasFormat::new(point_format_id).map_err(|e| Error::Las(format!("point format: {e}")))?;
     let extra_byte_count = source.extra_byte_count();
+    let point_record_length = point_format
+        .len()
+        .checked_add(extra_byte_count)
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "point record length with {extra_byte_count} extra bytes exceeds LAS u16 range"
+            ))
+        })?;
     point_format.extra_bytes = extra_byte_count;
-    let point_record_length = point_format.len();
 
     let (scale_x, scale_y, scale_z) = metadata.scale;
     let (offset_x, offset_y, offset_z) =
@@ -294,12 +328,22 @@ fn write_copc_inner<S: CopcPointSource>(
             .ok_or_else(|| Error::InvalidInput("VLR count overflow".into()))?,
     )
     .map_err(|_| Error::InvalidInput("VLR count overflow".into()))?;
+    if number_of_vlrs > MAX_VLR_COUNT {
+        return Err(Error::InvalidInput(format!(
+            "output VLR count {number_of_vlrs} exceeds max supported {MAX_VLR_COUNT}"
+        )));
+    }
     let number_of_evlrs = u32::try_from(
         1usize
             .checked_add(metadata.source_evlr_count_after_hierarchy())
             .ok_or_else(|| Error::InvalidInput("EVLR count overflow".into()))?,
     )
     .map_err(|_| Error::InvalidInput("EVLR count overflow".into()))?;
+    if number_of_evlrs > MAX_EVLR_COUNT {
+        return Err(Error::InvalidInput(format!(
+            "output EVLR count {number_of_evlrs} exceeds max supported {MAX_EVLR_COUNT}"
+        )));
+    }
     let var_vlr_body_size = u16::try_from(var_vlr_bytes.len())
         .map_err(|_| Error::InvalidInput("LAZ VLR byte size exceeds LAS VLR limit".into()))?;
     let var_vlr_storage_bytes = LAS_VLR_HEADER_BYTES
@@ -316,8 +360,8 @@ fn write_copc_inner<S: CopcPointSource>(
         .checked_add(total_vlr_bytes)
         .ok_or_else(|| Error::InvalidInput("point data offset overflow".into()))?;
 
-    let mut pending = PendingOutput::create(path)?;
-    let file = File::create(pending.temp_path()).map_err(|e| Error::io("create COPC file", e))?;
+    let pending = PendingOutput::create(path)?;
+    let file = pending.reopen()?;
     let mut writer = BufWriter::with_capacity(COPC_OUTPUT_BUFFER_BYTES, file);
 
     let header = LasHeader {
@@ -436,8 +480,9 @@ fn write_copc_inner<S: CopcPointSource>(
         gpstime_min: point_stats.gpstime_min,
         gpstime_max: point_stats.gpstime_max,
     };
+    let info_bytes = info.write_le_bytes()?;
     writer
-        .write_all(&info.write_le_bytes())
+        .write_all(&info_bytes)
         .map_err(|e| Error::io("patch COPC info", e))?;
 
     writer
@@ -464,9 +509,8 @@ fn write_copc_inner<S: CopcPointSource>(
 /// COPC file at the destination: the file is written to a same-directory temp
 /// name and atomically renamed into place on success.
 struct PendingOutput {
-    temp_path: std::path::PathBuf,
+    file: Option<NamedTempFile>,
     final_path: std::path::PathBuf,
-    committed: bool,
 }
 
 impl PendingOutput {
@@ -474,34 +518,58 @@ impl PendingOutput {
         let file_name = path.file_name().ok_or_else(|| {
             Error::InvalidInput(format!("output path {} has no file name", path.display()))
         })?;
-        let mut temp_name = std::ffi::OsString::from(".");
-        temp_name.push(file_name);
-        temp_name.push(format!(".{}.part", std::process::id()));
+        let mut prefix = std::ffi::OsString::from(".");
+        prefix.push(file_name);
+        prefix.push(".");
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file = tempfile::Builder::new()
+            .prefix(&prefix)
+            .suffix(".part")
+            .tempfile_in(parent)
+            .map_err(|e| Error::io("create temporary COPC file", e))?;
         Ok(Self {
-            temp_path: path.with_file_name(temp_name),
+            file: Some(file),
             final_path: path.to_path_buf(),
-            committed: false,
         })
     }
 
-    fn temp_path(&self) -> &Path {
-        &self.temp_path
+    fn reopen(&self) -> Result<File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| Error::InvalidInput("temporary COPC file already committed".into()))?
+            .reopen()
+            .map_err(|e| Error::io("open temporary COPC file", e))
     }
 
-    fn commit(&mut self) -> Result<()> {
-        std::fs::rename(&self.temp_path, &self.final_path)
-            .map_err(|e| Error::io("persist COPC file", e))?;
-        self.committed = true;
+    fn commit(mut self) -> Result<()> {
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| Error::InvalidInput("temporary COPC file already committed".into()))?;
+        file.persist(&self.final_path)
+            .map_err(|e| Error::io("persist COPC file", e.error))?;
+        sync_parent_directory(&self.final_path)?;
         Ok(())
     }
 }
 
-impl Drop for PendingOutput {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_file(&self.temp_path);
-        }
-    }
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| Error::io("sync COPC output directory", e))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Reads one node's ordered source indexes from the LOD order file and
@@ -520,7 +588,11 @@ fn encode_node_points<S: CopcPointSource>(
     cancel: &dyn CancelCheck,
 ) -> Result<()> {
     raw.clear();
-    raw.resize(node.count * record_len, 0);
+    let raw_len = node
+        .count
+        .checked_mul(record_len)
+        .ok_or_else(|| Error::InvalidInput("node point buffer size overflows usize".into()))?;
+    raw.resize(raw_len, 0);
     index_reader
         .seek(SeekFrom::Start(node.start))
         .map_err(|e| Error::io("seek LOD order", e))?;
@@ -560,7 +632,7 @@ fn hierarchy_entry(key: VoxelKey, offset: u64, byte_size: u64, count: usize) -> 
 /// chunk in order.
 #[cfg(not(feature = "parallel"))]
 #[allow(clippy::too_many_arguments)]
-fn compress_nodes<W: Write + Seek + Send, S: CopcPointSource>(
+fn compress_nodes<W: Write + Seek + Send + Sync, S: CopcPointSource>(
     writer: &mut W,
     var_vlr: &laz::LazVlr,
     lod_index: &crate::lod::LodIndex,
@@ -585,7 +657,9 @@ fn compress_nodes<W: Write + Seek + Send, S: CopcPointSource>(
         .get_mut()
         .stream_position()
         .map_err(|e| Error::io("record chunk start", e))?;
-    chunk_start_file_offset += 8;
+    chunk_start_file_offset = chunk_start_file_offset
+        .checked_add(8)
+        .ok_or_else(|| Error::InvalidInput("LAZ point-data offset overflows u64".into()))?;
 
     for node in &lod_index.nodes {
         cancel.check()?;
@@ -614,7 +688,9 @@ fn compress_nodes<W: Write + Seek + Send, S: CopcPointSource>(
         hierarchy.push(hierarchy_entry(
             node.key,
             chunk_start_file_offset,
-            after - chunk_start_file_offset,
+            after.checked_sub(chunk_start_file_offset).ok_or_else(|| {
+                Error::InvalidData("LAZ compressor moved before the chunk start".into())
+            })?,
             node.count,
         )?);
         chunk_start_file_offset = after;
@@ -710,7 +786,9 @@ fn compress_nodes<W: Write + Seek + Send, S: CopcPointSource>(
                 point_count: node.count as u64,
                 byte_count: chunk.len() as u64,
             });
-            chunk_start_file_offset += chunk.len() as u64;
+            chunk_start_file_offset = chunk_start_file_offset
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| Error::InvalidInput("LAZ point-data offset overflows u64".into()))?;
         }
     }
 
@@ -727,8 +805,10 @@ fn compress_nodes<W: Write + Seek + Send, S: CopcPointSource>(
     writer
         .seek(SeekFrom::Start(table_offset_position))
         .map_err(|e| Error::io("seek chunk table offset", e))?;
+    let chunk_table_position = i64::try_from(chunk_table_position)
+        .map_err(|_| Error::InvalidInput("LAZ chunk table offset exceeds i64 range".into()))?;
     writer
-        .write_i64::<LittleEndian>(chunk_table_position as i64)
+        .write_i64::<LittleEndian>(chunk_table_position)
         .map_err(|e| Error::io("patch chunk table offset", e))?;
     writer
         .seek(SeekFrom::Start(end_position))

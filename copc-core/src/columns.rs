@@ -1,5 +1,7 @@
 //! Column-oriented LAS/COPC point data.
 
+use std::collections::HashSet;
+
 use crate::{Error, Result};
 
 use las::point::Format as LasPointFormat;
@@ -533,7 +535,14 @@ impl LasColumnBatch {
 
     /// Validate scalar declarations and column lengths for this batch.
     pub fn validate(&self) -> Result<()> {
+        let mut dimensions = HashSet::with_capacity(self.columns.len());
         for (spec, data) in &self.columns {
+            if !dimensions.insert(spec.dimension) {
+                return Err(Error::InvalidInput(format!(
+                    "column {:?} appears more than once in the batch",
+                    spec.dimension
+                )));
+            }
             let point_count = spec.point_count_for_data(data)?;
             if point_count != self.len {
                 return Err(Error::InvalidInput(format!(
@@ -655,6 +664,22 @@ mod tests {
         };
 
         assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn batch_rejects_duplicate_dimensions() {
+        let batch = LasColumnBatch::new(vec![
+            (
+                ColumnSpec::new(LasDimension::Intensity, ScalarType::U16),
+                ColumnData::U16(vec![1]),
+            ),
+            (
+                ColumnSpec::new(LasDimension::Intensity, ScalarType::U16),
+                ColumnData::U16(vec![2]),
+            ),
+        ]);
+
+        assert!(batch.unwrap_err().to_string().contains("more than once"));
     }
 
     #[test]

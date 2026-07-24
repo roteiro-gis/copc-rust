@@ -28,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
@@ -57,7 +57,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
@@ -76,16 +76,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
-        run: rustup toolchain install 1.77.0 --profile minimal --no-self-update
+        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Check workspace
-        run: rustup run 1.77.0 cargo check --workspace --all-targets --locked
+        run: rustup run 1.88.0 cargo check --workspace --all-targets --all-features --locked
 
   package:
     name: Packaging
@@ -93,7 +93,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
@@ -116,7 +116,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -132,7 +132,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust nightly
         run: |

@@ -1,4 +1,4 @@
-//! Fuzz COPC metadata parsing: header, VLRs, EVLRs, and recursive hierarchy.
+//! Fuzz COPC metadata parsing: header, VLRs, EVLRs, and iterative hierarchy.
 
 #![no_main]
 
