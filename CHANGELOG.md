@@ -39,7 +39,7 @@ that forced custom sources to panic.
   and returns `copc_core::Result<VoxelKey>`
 - malformed or non-conformant files that older releases accepted can now fail
   during `CopcFile::open` or `CopcRangeReader::open`
-- MSRV is now Rust 1.86, required by the current dependency graph
+- MSRV is now Rust 1.88, required by the current dependency graph
 
 ### Fixed
 
