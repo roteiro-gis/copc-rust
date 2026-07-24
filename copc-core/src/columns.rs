@@ -271,7 +271,7 @@ impl ColumnSpec {
             let width = self.extra_byte_width().ok_or_else(|| {
                 Error::InvalidInput("ExtraBytes column requires a non-zero byte width".into())
             })?;
-            if data.len() % width != 0 {
+            if !data.len().is_multiple_of(width) {
                 return Err(Error::InvalidInput(format!(
                     "ExtraBytes column has {} bytes, which is not divisible by byte width {width}",
                     data.len()

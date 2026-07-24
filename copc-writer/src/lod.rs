@@ -155,7 +155,7 @@ impl<S: CopcPointSource, W: Write> LodIndexBuilder<'_, S, W> {
 fn write_root_index_run(total_points: u32, cancel: &dyn CancelCheck) -> Result<IndexRun> {
     let mut writer = BufWriter::with_capacity(INDEX_IO_BUFFER_BYTES, new_index_tempfile("root")?);
     for index in 0..total_points {
-        if index as usize % CANCEL_POLL_STRIDE == 0 {
+        if (index as usize).is_multiple_of(CANCEL_POLL_STRIDE) {
             cancel.check()?;
         }
         writer
@@ -183,7 +183,7 @@ fn partition_index_run<S: CopcPointSource>(
     let mut counts = [0usize; 8];
     let center = bounds.center();
     for read_index in 0..run.count {
-        if read_index % CANCEL_POLL_STRIDE == 0 {
+        if read_index.is_multiple_of(CANCEL_POLL_STRIDE) {
             cancel.check()?;
         }
         let index = reader
@@ -276,7 +276,7 @@ fn append_index_run_to_order<W: Write>(
 ) -> Result<()> {
     let mut reader = open_index_run(run)?;
     for read_index in 0..run.count {
-        if read_index % CANCEL_POLL_STRIDE == 0 {
+        if read_index.is_multiple_of(CANCEL_POLL_STRIDE) {
             cancel.check()?;
         }
         let index = reader

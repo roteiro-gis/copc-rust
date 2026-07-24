@@ -142,7 +142,7 @@ pub(crate) fn validate_source_points<S: CopcPointSource>(
     let mut stats = PointStats::new();
     let mut fields = CopcPointFields::default();
     for index in 0..source.len() {
-        if index % CANCEL_POLL_STRIDE == 0 {
+        if index.is_multiple_of(CANCEL_POLL_STRIDE) {
             cancel.check()?;
         }
         let (x, y, z) = source.xyz(index)?;

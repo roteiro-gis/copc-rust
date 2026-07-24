@@ -237,13 +237,13 @@ fn grid_points(count: usize) -> Vec<CopcPointFields> {
                 intensity: (10_000 + i) as u16,
                 return_number: ((i % 4) + 1) as u8,
                 number_of_returns: 4,
-                synthetic: u8::from(i % 11 == 0),
-                key_point: u8::from(i % 13 == 0),
-                withheld: u8::from(i % 17 == 0),
-                overlap: u8::from(i % 19 == 0),
+                synthetic: u8::from(i.is_multiple_of(11)),
+                key_point: u8::from(i.is_multiple_of(13)),
+                withheld: u8::from(i.is_multiple_of(17)),
+                overlap: u8::from(i.is_multiple_of(19)),
                 scan_channel: (i % 4) as u8,
                 scan_direction_flag: (i % 2) as u8,
-                edge_of_flight_line: u8::from(i % 7 == 0),
+                edge_of_flight_line: u8::from(i.is_multiple_of(7)),
                 classification: (i % 32) as u8,
                 user_data: (i % 251) as u8,
                 scan_angle: (i as f32 % 90.0) - 45.0,
@@ -288,16 +288,16 @@ fn column_batch(count: usize) -> LasColumnBatch {
         intensity.push((20_000 + i) as u16);
         return_number.push(((i % 4) + 1) as u8);
         number_of_returns.push(4);
-        classification.push(if i % 2 == 0 { 2 } else { 6 });
-        scan_direction_flag.push(i % 2 == 0);
-        edge_of_flight_line.push(i % 5 == 0);
+        classification.push(if i.is_multiple_of(2) { 2 } else { 6 });
+        scan_direction_flag.push(i.is_multiple_of(2));
+        edge_of_flight_line.push(i.is_multiple_of(5));
         scan_angle.push(((i % 181) as f32 - 90.0) * 0.006);
         user_data.push((i % 251) as u8);
         point_source_id.push((1_000 + i) as u16);
-        synthetic.push(i % 7 == 0);
-        key_point.push(i % 11 == 0);
-        withheld.push(i % 13 == 0);
-        overlap.push(i % 17 == 0);
+        synthetic.push(i.is_multiple_of(7));
+        key_point.push(i.is_multiple_of(11));
+        withheld.push(i.is_multiple_of(13));
+        overlap.push(i.is_multiple_of(17));
         scan_channel.push((i % 4) as u8);
         gps_time.push(1.0e9 + i as f64 * 0.25);
         red.push((i * 3) as u16);

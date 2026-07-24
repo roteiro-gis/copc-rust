@@ -211,7 +211,7 @@ impl HierarchyPage {
     }
 
     pub fn from_le_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() % HIERARCHY_ENTRY_BYTES != 0 {
+        if !bytes.len().is_multiple_of(HIERARCHY_ENTRY_BYTES) {
             return Err(Error::InvalidData(format!(
                 "hierarchy page is {} bytes, not a multiple of {}",
                 bytes.len(),

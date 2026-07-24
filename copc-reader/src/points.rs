@@ -306,7 +306,7 @@ impl ChunkColumnDecoder {
         let mut point_buf = vec![0u8; self.record_size];
         let mut accepted = 0usize;
         for decoded in 0..points_in_chunk {
-            if decoded % CANCEL_POLL_STRIDE == 0 {
+            if decoded.is_multiple_of(CANCEL_POLL_STRIDE) {
                 if let Some(cancel) = cancel {
                     cancel.check()?;
                 }
@@ -780,7 +780,7 @@ impl<'a, R: Read + Seek + Send> PointIter<'a, R> {
                 }
             }
 
-            if self.decoded_points % CANCEL_POLL_STRIDE == 0 {
+            if self.decoded_points.is_multiple_of(CANCEL_POLL_STRIDE) {
                 if let Some(cancel) = self.cancel {
                     cancel.check()?;
                 }

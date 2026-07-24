@@ -310,7 +310,7 @@ impl<S: RangeRead> CopcRangeReader<S> {
         if !self.visited_pages.insert((page_entry.offset, byte_size)) {
             return Ok(());
         }
-        if byte_size == 0 || byte_size % copc_core::HIERARCHY_ENTRY_BYTES as u64 != 0 {
+        if byte_size == 0 || !byte_size.is_multiple_of(copc_core::HIERARCHY_ENTRY_BYTES as u64) {
             return Err(Error::InvalidData(format!(
                 "hierarchy page is {byte_size} bytes, not a multiple of {}",
                 copc_core::HIERARCHY_ENTRY_BYTES

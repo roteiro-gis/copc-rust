@@ -86,7 +86,10 @@ impl CopcInfo {
                 "COPC root hierarchy page is empty".into(),
             ));
         }
-        if self.root_hier_size % HIERARCHY_ENTRY_BYTES as u64 != 0 {
+        if !self
+            .root_hier_size
+            .is_multiple_of(HIERARCHY_ENTRY_BYTES as u64)
+        {
             return Err(Error::InvalidData(format!(
                 "COPC root hierarchy size {} is not a multiple of {HIERARCHY_ENTRY_BYTES}",
                 self.root_hier_size

@@ -369,7 +369,7 @@ fn read_hierarchy_page_at<R: Read + Seek>(
     if byte_size == 0 {
         return Err(Error::InvalidData("hierarchy page is empty".into()));
     }
-    if byte_size % HIERARCHY_ENTRY_BYTES as u64 != 0 {
+    if !byte_size.is_multiple_of(HIERARCHY_ENTRY_BYTES as u64) {
         return Err(Error::InvalidData(format!(
             "hierarchy page is {byte_size} bytes, not a multiple of {HIERARCHY_ENTRY_BYTES}"
         )));

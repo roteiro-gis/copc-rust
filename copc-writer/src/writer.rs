@@ -123,7 +123,7 @@ where
     validate_streaming_layout_supported(&layout)?;
     let mut spill = SpillWriter::create(spill_dir, layout)?;
     for (index, item) in points.into_iter().enumerate() {
-        if index % CANCEL_POLL_STRIDE == 0 {
+        if index.is_multiple_of(CANCEL_POLL_STRIDE) {
             cancel.check()?;
         }
         spill.push(&item?)?;
@@ -193,7 +193,7 @@ fn convert_las_to_copc_streaming_inner(
             break;
         }
         for result in point_data.points() {
-            if index % CANCEL_POLL_STRIDE == 0 {
+            if index.is_multiple_of(CANCEL_POLL_STRIDE) {
                 cancel.check()?;
             }
             let point = result.map_err(|e| Error::Las(e.to_string()))?;
@@ -597,7 +597,7 @@ fn encode_node_points<S: CopcPointSource>(
         .seek(SeekFrom::Start(node.start))
         .map_err(|e| Error::io("seek LOD order", e))?;
     for point_index in 0..node.count {
-        if point_index % CANCEL_POLL_STRIDE == 0 {
+        if point_index.is_multiple_of(CANCEL_POLL_STRIDE) {
             cancel.check()?;
         }
         let source_index = index_reader
