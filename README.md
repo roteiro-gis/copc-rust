@@ -16,7 +16,7 @@ read-only memory mapping of writer spill files.
 | Crate | Description |
 |---|---|
 | `copc-core` | Shared COPC metadata, hierarchy entries, voxel keys, bounds, LAS-native column batches, streaming LAS records, and errors |
-| `copc-reader` | COPC header/info parsing, recursive hierarchy access, chunked-LAZ row iteration, and materialized column reads |
+| `copc-reader` | Strict COPC header/info parsing, iterative hierarchy access, chunked-LAZ row iteration, and materialized column reads |
 | `copc-writer` | COPC writer with source-trait point access, column-batch source support, native LOD distribution, mmap spill support, and streaming LAS/LAZ intake |
 
 ## Usage
@@ -112,7 +112,7 @@ All features are off by default, keeping the crates dependency-light.
 | `copc-writer` | `parallel` | rayon-parallel LAZ chunk compression (one octree node per chunk, written in order with a standard chunk table) |
 | `copc-reader` | `parallel` | rayon-parallel chunk decoding for `read_columns` |
 | `copc-reader` | `http` | `HttpRangeReader` over HTTP `Range` requests (plain HTTP) |
-| `copc-reader` | `http-tls` | enables `ureq/tls` so `HttpRangeReader` can fetch HTTPS URLs |
+| `copc-reader` | `http-tls` | enables `ureq/rustls` so `HttpRangeReader` can fetch HTTPS URLs |
 
 ## Column Ownership Model
 
@@ -139,7 +139,7 @@ behind a future optional feature.
 ## Supported Now
 
 - Public COPC hierarchy types for availability, indexing, and tile serving
-- COPC info VLR and recursive hierarchy page parsing
+- COPC info VLR and stack-safe iterative hierarchy page parsing
 - Chunked-LAZ point iteration in `copc-reader`
 - All-points, LOD-selected, and bounds-selected reader point iteration
 - Materialized LAS/COPC-native column batches in `copc-reader`
@@ -150,7 +150,8 @@ behind a future optional feature.
   descriptors, and source non-CRS VLRs/EVLRs
 - Streaming conversion can accept caller-resolved WKT for GeoTIFF-only CRS
   inputs without adding a geodesy dependency to `copc-writer`
-- LAS 1.4 point formats 6 and 7 with LAZ variable-size chunks
+- Reading LAS 1.4 point formats 6, 7, and 8 with LAZ variable-size chunks
+- Writing LAS 1.4 point formats 6 and 7 with LAZ variable-size chunks
 - Interior-node representative points for native LOD reads
 - Lazy remote reads over byte-range sources (`CopcRangeReader`, `RangeRead`,
   optional HTTP source) with on-demand hierarchy loading and coalesced chunk
@@ -172,8 +173,8 @@ behind a future optional feature.
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-cargo test --workspace --all-features
+cargo test --workspace --locked
+cargo test --workspace --all-features --locked
 ```
 
 Checked-in external COPC fixtures from PDAL and QGIS are exercised by:
