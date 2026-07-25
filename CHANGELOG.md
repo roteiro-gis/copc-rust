@@ -2,6 +2,72 @@
 
 ## Unreleased
 
+## 0.9.0 - 2026-07-23
+
+This release hardens every untrusted-input boundary, makes writer failures
+transactional, updates the LAS/LAZ and HTTP stacks, and removes API contracts
+that forced custom sources to panic.
+
+### Security
+
+- validate LAS 1.4 version/header fields, compression and point-format flags,
+  numeric transforms and bounds, VLR/EVLR reserved fields, required VLR
+  uniqueness, COPC info reserved bytes, hierarchy key/entry invariants, and
+  query bounds before allocating or decoding
+- constrain point chunks to the LAS point-data section and child hierarchy
+  pages to the hierarchy EVLR body; reject overlapping point chunks and
+  hierarchy totals that do not exactly match the LAS extended point count
+- cap individual point chunks, hierarchy pages and totals, eager remote VLR
+  sections, coalesced range requests, and source EVLR data
+- restrict streaming LAZ decoding to each hierarchy entry's declared byte
+  range so malformed chunks cannot consume following chunks or metadata
+- validate HTTP `Content-Range` values, stable source length, and exact response
+  body size while requesting identity encoding
+- create output files with securely randomized same-directory temporary names,
+  sync file and directory data, and atomically persist only complete output
+
+### Breaking
+
+- `CopcPointSource::xyz` now returns
+  `copc_core::Result<(f64, f64, f64)>`; custom sources can report indexing,
+  storage, or decoding failures instead of panicking
+- `SpillReader::xyz_at` likewise returns
+  `copc_core::Result<(f64, f64, f64)>`
+- `CopcInfo::write_le_bytes` now validates the structure and returns
+  `copc_core::Result<[u8; 160]>`; `CopcInfo::validate` is public
+- `VoxelKey::child` now validates the parent and octant, checks arithmetic,
+  and returns `copc_core::Result<VoxelKey>`
+- malformed or non-conformant files that older releases accepted can now fail
+  during `CopcFile::open` or `CopcRangeReader::open`
+- MSRV is now Rust 1.88, required by the current dependency graph
+
+### Fixed
+
+- prevent overflow when computing centers for large finite bounds
+- reject duplicate columns, inconsistent `xyz`/`fields_into` coordinates,
+  zero point budgets, invalid empty spill mappings, oversized coincident LOD
+  leaves, duplicate hierarchy keys, and invalid empty hierarchy entries
+- make spill statistics updates transactional so failed serialization cannot
+  leave counts and bounds out of sync with disk
+- preserve exact error propagation throughout fallible source coordinate
+  access and remove production-only invariant panics
+
+### Performance
+
+- use bounded point batches with the `las` 0.10 buffered read API during
+  LAS/LAZ conversion
+- cap initial column reservations derived from untrusted counts and bound
+  remote coalescing to 64 MiB per request
+- keep point encoding, LOD indexing, and spill storage out-of-core while
+  validating merged parallel column layouts in release builds
+
+### Dependencies
+
+- update `las` from 0.8 to 0.10 and `laz` from 0.8 to 0.12, eliminating the
+  duplicate LAZ implementation previously present in the graph
+- update `ureq` from 2 to 3, Criterion from 0.5 to 0.8, Rayon to 1.12, and
+  refresh transitive dependencies
+
 ## 0.5.0 - 2026-07-10
 
 Security hardening, breaking API corrections, hot-path performance work,

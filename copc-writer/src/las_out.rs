@@ -32,6 +32,14 @@ pub(crate) struct LasHeader {
 
 impl LasHeader {
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+        validate_las_string("system identifier", &self.system_identifier, 32)?;
+        validate_las_string("generating software", &self.generating_software, 32)?;
+        if !(1..=366).contains(&self.creation_day_of_year) || self.creation_year == 0 {
+            return Err(Error::InvalidInput(format!(
+                "LAS creation date must contain day 1..=366 and a non-zero year, got day {} year {}",
+                self.creation_day_of_year, self.creation_year
+            )));
+        }
         writer
             .write_all(b"LASF")
             .map_err(|e| Error::io("write LAS signature", e))?;
@@ -157,6 +165,8 @@ pub(crate) fn write_vlr_header<W: Write>(
     body_size: u16,
     description: &str,
 ) -> Result<()> {
+    validate_las_string("VLR user id", user_id, 16)?;
+    validate_las_string("VLR description", description, 32)?;
     writer
         .write_u16::<LittleEndian>(0)
         .map_err(|e| Error::io("write VLR reserved", e))?;
@@ -220,6 +230,8 @@ pub(crate) fn write_evlr_header<W: Write>(
     body_size: u64,
     description: &str,
 ) -> Result<()> {
+    validate_las_string("EVLR user id", user_id, 16)?;
+    validate_las_string("EVLR description", description, 32)?;
     writer
         .write_u16::<LittleEndian>(0)
         .map_err(|e| Error::io("write EVLR reserved", e))?;
@@ -235,6 +247,26 @@ pub(crate) fn write_evlr_header<W: Write>(
     writer
         .write_all(&pad(description.as_bytes(), 32))
         .map_err(|e| Error::io("write EVLR description", e))?;
+    Ok(())
+}
+
+fn validate_las_string(name: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if !value.is_ascii() {
+        return Err(Error::InvalidInput(format!(
+            "LAS {name} must contain only ASCII characters"
+        )));
+    }
+    if value.as_bytes().contains(&0) {
+        return Err(Error::InvalidInput(format!(
+            "LAS {name} must not contain an embedded NUL"
+        )));
+    }
+    if value.len() > max_bytes {
+        return Err(Error::InvalidInput(format!(
+            "LAS {name} is {} bytes, max is {max_bytes}",
+            value.len()
+        )));
+    }
     Ok(())
 }
 

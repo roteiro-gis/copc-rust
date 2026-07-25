@@ -19,9 +19,9 @@ impl CopcPointSource for VecSource {
         self.points.len()
     }
 
-    fn xyz(&self, index: usize) -> (f64, f64, f64) {
+    fn xyz(&self, index: usize) -> copc_core::Result<(f64, f64, f64)> {
         let p = &self.points[index];
-        (p.x, p.y, p.z)
+        Ok((p.x, p.y, p.z))
     }
 
     fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {

@@ -22,15 +22,15 @@ parallel = ["dep:rayon"]
 ## HTTP range-request source for `CopcRangeReader` (plain HTTP out of the box).
 http = ["dep:ureq"]
 ## Enables TLS in ureq so `HttpRangeReader` can fetch HTTPS URLs.
-http-tls = ["http", "ureq/tls"]
+http-tls = ["http", "ureq/rustls"]
 
 [dependencies]
 byteorder = { workspace = true }
-copc-core = { version = "0.5.0", path = "../copc-core" }
+copc-core = { version = "0.9.0", path = "../copc-core" }
 las = { workspace = true }
 laz = { workspace = true }
 rayon = { workspace = true, optional = true }
-ureq = { version = "2", optional = true, default-features = false }
+ureq = { version = "3", optional = true, default-features = false }
 
 # Path-only (version-less) so packaging strips it; repo tests and benches
 # needing the writer are excluded from the published package.

@@ -42,9 +42,9 @@ impl CopcPointSource for SyntheticSource {
         self.count
     }
 
-    fn xyz(&self, index: usize) -> (f64, f64, f64) {
+    fn xyz(&self, index: usize) -> Result<(f64, f64, f64)> {
         let p = self.point(index);
-        (p.x, p.y, p.z)
+        Ok((p.x, p.y, p.z))
     }
 
     fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> Result<()> {
@@ -57,7 +57,7 @@ fn write_fixture(path: &Path, count: usize) {
     let source = SyntheticSource { count };
     let mut bounds = Bounds::point(0.0, 0.0, 0.0);
     for index in 0..count {
-        let (x, y, z) = source.xyz(index);
+        let (x, y, z) = source.xyz(index).unwrap();
         bounds.extend(x, y, z);
     }
     write_source(

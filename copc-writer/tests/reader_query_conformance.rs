@@ -13,9 +13,9 @@ impl CopcPointSource for VecSource {
         self.points.len()
     }
 
-    fn xyz(&self, index: usize) -> (f64, f64, f64) {
+    fn xyz(&self, index: usize) -> copc_core::Result<(f64, f64, f64)> {
         let point = &self.points[index];
-        (point.x, point.y, point.z)
+        Ok((point.x, point.y, point.z))
     }
 
     fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {
@@ -123,13 +123,13 @@ fn grid_points(count: usize) -> Vec<CopcPointFields> {
                 intensity: (i % u16::MAX as usize) as u16,
                 return_number: ((i % 4) + 1) as u8,
                 number_of_returns: 4,
-                synthetic: u8::from(i % 11 == 0),
-                key_point: u8::from(i % 13 == 0),
-                withheld: u8::from(i % 17 == 0),
-                overlap: u8::from(i % 19 == 0),
+                synthetic: u8::from(i.is_multiple_of(11)),
+                key_point: u8::from(i.is_multiple_of(13)),
+                withheld: u8::from(i.is_multiple_of(17)),
+                overlap: u8::from(i.is_multiple_of(19)),
                 scan_channel: (i % 4) as u8,
                 scan_direction_flag: (i % 2) as u8,
-                edge_of_flight_line: u8::from(i % 7 == 0),
+                edge_of_flight_line: u8::from(i.is_multiple_of(7)),
                 classification: (i % 32) as u8,
                 user_data: (i % 251) as u8,
                 scan_angle: (i as f32 % 180.0) - 90.0,

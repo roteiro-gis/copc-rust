@@ -2,7 +2,6 @@ use std::path::Path;
 
 use copc_core::{LasPointRecord, NeverCancel, StreamingLayout};
 use copc_writer::{write_streaming_with_cancel, CopcWriteMetadata, CopcWriterParams, SpillWriter};
-use las::Read as _;
 
 #[test]
 fn lod_index_and_spill_remain_disk_backed() {
@@ -29,7 +28,7 @@ fn lod_index_and_spill_remain_disk_backed() {
     assert_not_contains(writer_src, "Vec<u32>");
 
     assert_contains(spill_src, "scratch: Vec<u8>");
-    assert_contains(spill_src, "mmap: Mmap");
+    assert_contains(spill_src, "mmap: Option<Mmap>");
     assert_contains(spill_src, "Mmap::map(&file)");
     assert_not_contains(spill_src, "records: Vec<LasPointRecord>");
     assert_not_contains(spill_src, "Vec<LasPointRecord>");

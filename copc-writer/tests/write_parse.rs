@@ -8,7 +8,6 @@ use copc_writer::{
 };
 use las::point::ScanDirection;
 use las::{Color, Point};
-use las::{Read as _, Write as _};
 use std::io::{Read as _, Seek as _, SeekFrom};
 
 struct VecSource {
@@ -17,20 +16,108 @@ struct VecSource {
 
 type PointMutator = fn(&mut CopcPointFields);
 
+fn read_all_las_points(reader: &mut las::Reader) -> Vec<Point> {
+    reader
+        .read_all()
+        .unwrap()
+        .points()
+        .collect::<las::Result<Vec<_>>>()
+        .unwrap()
+}
+
 impl CopcPointSource for VecSource {
     fn len(&self) -> usize {
         self.points.len()
     }
 
-    fn xyz(&self, index: usize) -> (f64, f64, f64) {
+    fn xyz(&self, index: usize) -> copc_core::Result<(f64, f64, f64)> {
         let p = &self.points[index];
-        (p.x, p.y, p.z)
+        Ok((p.x, p.y, p.z))
     }
 
     fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {
         out.clone_from(&self.points[index]);
         Ok(())
     }
+}
+
+struct FailingXyzSource;
+
+impl CopcPointSource for FailingXyzSource {
+    fn len(&self) -> usize {
+        1
+    }
+
+    fn xyz(&self, _index: usize) -> copc_core::Result<(f64, f64, f64)> {
+        Err(copc_core::Error::InvalidData(
+            "synthetic coordinate lookup failure".into(),
+        ))
+    }
+
+    fn fields_into(&self, _index: usize, _out: &mut CopcPointFields) -> copc_core::Result<()> {
+        unreachable!("coordinate lookup must fail before fields are requested")
+    }
+}
+
+struct OversizedExtraBytesSource;
+
+impl CopcPointSource for OversizedExtraBytesSource {
+    fn len(&self) -> usize {
+        1
+    }
+
+    fn xyz(&self, _index: usize) -> copc_core::Result<(f64, f64, f64)> {
+        Ok((0.0, 0.0, 0.0))
+    }
+
+    fn fields_into(&self, _index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {
+        *out = point_fields(0.0, 0.0, 0.0);
+        Ok(())
+    }
+
+    fn extra_byte_count(&self) -> u16 {
+        u16::MAX
+    }
+}
+
+#[test]
+fn writer_propagates_coordinate_source_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("coordinate-error.copc.laz");
+
+    let err = write_source(
+        &path,
+        &FailingXyzSource,
+        false,
+        Bounds::point(0.0, 0.0, 0.0),
+        &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
+    )
+    .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("synthetic coordinate lookup failure"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn writer_rejects_point_record_length_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized-point-record.copc.laz");
+
+    let err = write_source(
+        &path,
+        &OversizedExtraBytesSource,
+        false,
+        Bounds::point(0.0, 0.0, 0.0),
+        &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("exceeds LAS u16 range"));
+    assert!(!path.exists());
 }
 
 #[test]
@@ -217,10 +304,7 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
     let mut las_reader = las::Reader::from_path(&path).unwrap();
     assert_eq!(7, las_reader.header().point_format().to_u8().unwrap());
     assert_eq!(points.len() as u64, las_reader.header().number_of_points());
-    let las_points = las_reader
-        .points()
-        .collect::<las::Result<Vec<_>>>()
-        .unwrap();
+    let las_points = read_all_las_points(&mut las_reader);
     assert_las_points_match_fields(&points, &las_points);
 }
 
@@ -460,7 +544,7 @@ fn streaming_conversion_preserves_fractional_scan_angle_degrees() {
     builder.point_format = las::point::Format::new(6).unwrap();
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -510,7 +594,7 @@ fn streaming_conversion_preserves_supported_header_metadata() {
     builder.point_format = las::point::Format::new(6).unwrap();
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -561,7 +645,7 @@ fn streaming_conversion_preserves_extra_point_bytes_and_descriptor() {
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     let expected_extra = vec![0x11, 0x22, 0xFE];
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -598,7 +682,7 @@ fn streaming_conversion_preserves_extra_point_bytes_and_descriptor() {
     assert_eq!(1, descriptors.len());
     assert_eq!(descriptor.as_slice(), descriptors[0].data.as_slice());
 
-    let points = reader.points().collect::<las::Result<Vec<_>>>().unwrap();
+    let points = read_all_las_points(&mut reader);
     assert_eq!(1, points.len());
     assert_eq!(expected_extra, points[0].extra_bytes);
 }
@@ -615,7 +699,7 @@ fn streaming_conversion_rejects_unsupported_point_dimensions() {
     builder.point_format = las::point::Format::new(8).unwrap();
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -653,7 +737,7 @@ fn streaming_conversion_rejects_waveform_point_dimensions() {
     builder.point_format = las::point::Format::new(9).unwrap();
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -706,7 +790,7 @@ fn streaming_conversion_preserves_wkt_crs_vlr() {
     });
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -762,7 +846,7 @@ fn streaming_conversion_preserves_wkt_crs_evlr() {
     });
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -826,7 +910,7 @@ fn streaming_conversion_preserves_non_crs_vlrs_and_evlrs() {
     });
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -904,10 +988,7 @@ fn streaming_conversion_preserves_combined_extra_bytes_metadata_and_crs() {
         .find(|vlr| vlr.user_id == "LASF_Spec" && vlr.record_id == 4)
         .unwrap()
         .clone();
-    let source_points = source_reader
-        .points()
-        .collect::<las::Result<Vec<_>>>()
-        .unwrap();
+    let source_points = read_all_las_points(&mut source_reader);
     let source_evlrs = read_las_evlrs(&las_path);
     let source_custom_evlr = source_evlrs
         .iter()
@@ -960,10 +1041,7 @@ fn streaming_conversion_preserves_combined_extra_bytes_metadata_and_crs() {
     assert_eq!(source_custom_vlr.description, vlrs[4].description);
     assert_eq!(source_custom_vlr.data.as_slice(), vlrs[4].data.as_slice());
 
-    let las_points = las_reader
-        .points()
-        .collect::<las::Result<Vec<_>>>()
-        .unwrap();
+    let las_points = read_all_las_points(&mut las_reader);
     assert_las_points_match_points(&source_points, &las_points);
 
     let evlrs = read_las_evlrs(&copc_path);
@@ -1031,10 +1109,7 @@ fn streaming_conversion_preserves_combined_shape_from_copc_laz_input() {
         .find(|vlr| vlr.user_id == "shape_test" && vlr.record_id == 77)
         .unwrap()
         .clone();
-    let source_points = source_reader
-        .points()
-        .collect::<las::Result<Vec<_>>>()
-        .unwrap();
+    let source_points = read_all_las_points(&mut source_reader);
     let source_custom_evlr = source_evlrs
         .iter()
         .find(|evlr| evlr.user_id == "shape_test" && evlr.record_id == 78)
@@ -1088,10 +1163,7 @@ fn streaming_conversion_preserves_combined_shape_from_copc_laz_input() {
     assert_eq!(source_custom_vlr.description, vlrs[4].description);
     assert_eq!(source_custom_vlr.data.as_slice(), vlrs[4].data.as_slice());
 
-    let las_points = las_reader
-        .points()
-        .collect::<las::Result<Vec<_>>>()
-        .unwrap();
+    let las_points = read_all_las_points(&mut las_reader);
     assert_las_points_match_points(&source_points, &las_points);
 
     let evlrs = read_las_evlrs(&output_copc_path);
@@ -1204,7 +1276,7 @@ fn streaming_conversion_allows_source_laszip_vlr() {
     builder.point_format = las::point::Format::new(6).unwrap();
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -1387,7 +1459,7 @@ fn write_geotiff_only_crs_las(path: &std::path::Path) {
     });
     let mut writer = las::Writer::from_path(path, builder.into_header().unwrap()).unwrap();
     writer
-        .write(las::Point {
+        .write_point(las::Point {
             x: 1.0,
             y: 2.0,
             z: 3.0,
@@ -1456,7 +1528,7 @@ fn write_combined_metadata_shape_las(path: &std::path::Path) {
 
     let mut writer = las::Writer::from_path(path, builder.into_header().unwrap()).unwrap();
     for point in combined_metadata_shape_points() {
-        writer.write(point).unwrap();
+        writer.write_point(point).unwrap();
     }
     writer.close().unwrap();
 }

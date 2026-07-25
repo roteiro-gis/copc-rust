@@ -67,9 +67,9 @@ impl CopcPointSource for VecSource {
         self.points.len()
     }
 
-    fn xyz(&self, index: usize) -> (f64, f64, f64) {
+    fn xyz(&self, index: usize) -> copc_core::Result<(f64, f64, f64)> {
         let p = &self.points[index];
-        (p.x, p.y, p.z)
+        Ok((p.x, p.y, p.z))
     }
 
     fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {
@@ -297,8 +297,8 @@ fn copc_with_child_hierarchy_page() -> (Vec<u8>, u64) {
     let root_hier_size = 2 * 32u64;
     let child_page_offset = root_hier_offset + root_hier_size;
 
-    let child_key = VoxelKey::root().child(3);
-    let grandchild_key = child_key.child(5);
+    let child_key = VoxelKey::root().child(3).unwrap();
+    let grandchild_key = child_key.child(5).unwrap();
     let child_page = HierarchyPage::new(vec![
         Entry {
             key: child_key,
@@ -342,11 +342,16 @@ fn copc_with_child_hierarchy_page() -> (Vec<u8>, u64) {
 
     let mut out = Vec::new();
     write_las_header(&mut out, offset_to_point_data, evlr_start, 12);
-    write_vlr(&mut out, "copc", 1, &info.write_le_bytes());
+    write_vlr(&mut out, "copc", 1, &info.write_le_bytes().unwrap());
     write_vlr(&mut out, "laszip encoded", 22204, &laz_vlr_bytes);
     assert_eq!(out.len(), offset_to_point_data as usize);
     out.resize(evlr_start as usize, 0);
-    write_evlr_header(&mut out, "copc", 1000, root_page_bytes.len() as u64);
+    write_evlr_header(
+        &mut out,
+        "copc",
+        1000,
+        (root_page_bytes.len() + child_page_bytes.len()) as u64,
+    );
     assert_eq!(out.len() as u64, root_hier_offset);
     out.extend_from_slice(&root_page_bytes);
     assert_eq!(out.len() as u64, child_page_offset);
@@ -357,6 +362,7 @@ fn copc_with_child_hierarchy_page() -> (Vec<u8>, u64) {
 fn write_las_header(out: &mut Vec<u8>, offset_to_point_data: u32, evlr_start: u64, points: u64) {
     out.resize(375, 0);
     out[0..4].copy_from_slice(b"LASF");
+    out[6..8].copy_from_slice(&0x10u16.to_le_bytes());
     out[24] = 1;
     out[25] = 4;
     out[94..96].copy_from_slice(&375u16.to_le_bytes());
