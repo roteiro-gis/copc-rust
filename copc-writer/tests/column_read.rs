@@ -252,6 +252,7 @@ fn grid_points(count: usize) -> Vec<CopcPointFields> {
                 red: (i % u16::MAX as usize) as u16,
                 green: ((i * 3) % u16::MAX as usize) as u16,
                 blue: ((i * 7) % u16::MAX as usize) as u16,
+                nir: 0,
                 extra_bytes: Vec::new(),
             }
         })
@@ -437,4 +438,52 @@ fn assert_column_data_eq(dimension: LasDimension, expected: &ColumnData, actual:
             actual.scalar()
         ),
     }
+}
+
+#[test]
+fn column_batch_source_writes_nir_as_point_format_8() {
+    let mut batch = column_batch(384);
+    let nir: Vec<u16> = (0..384u16).map(|i| 50_000 + i).collect();
+    batch
+        .columns
+        .push(column(LasDimension::Nir, ColumnData::U16(nir.clone())));
+    let source = ColumnBatchSource::new(&batch).unwrap();
+    assert!(source.has_nir());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nir.copc.laz");
+
+    write_source(
+        &path,
+        &source,
+        source.has_color(),
+        source.bounds().unwrap(),
+        &CopcWriterParams::new(1_024),
+        &CopcWriteMetadata::default(),
+    )
+    .unwrap();
+
+    let mut reader = CopcReader::from_path(&path).unwrap();
+    assert_eq!(8, reader.header().point_data_record_format & 0x3F);
+    let roundtripped = reader
+        .read_columns(PointQuery::all(), ColumnSelection::all())
+        .unwrap();
+    for (spec, expected) in &batch.columns {
+        let actual = roundtripped
+            .column(spec.dimension)
+            .unwrap_or_else(|| panic!("missing {:?} column", spec.dimension));
+        assert_column_data_eq(spec.dimension, expected, actual);
+    }
+
+    let mut without_rgb = column_batch(4);
+    without_rgb.columns.retain(|(spec, _)| {
+        !matches!(
+            spec.dimension,
+            LasDimension::Red | LasDimension::Green | LasDimension::Blue
+        )
+    });
+    without_rgb
+        .columns
+        .push(column(LasDimension::Nir, ColumnData::U16(vec![1; 4])));
+    let err = ColumnBatchSource::new(&without_rgb).err().unwrap();
+    assert!(err.to_string().contains("requires Red, Green, and Blue"));
 }

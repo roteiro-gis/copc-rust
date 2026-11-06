@@ -138,6 +138,7 @@ fn grid_points(count: usize) -> Vec<CopcPointFields> {
                 red: 0,
                 green: 0,
                 blue: 0,
+                nir: 0,
                 extra_bytes: Vec::new(),
             }
         })
