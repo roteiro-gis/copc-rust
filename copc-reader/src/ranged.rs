@@ -212,6 +212,7 @@ impl<S: RangeRead> CopcRangeReader<S> {
             point_format,
             transforms_for(&self.header),
             bounds,
+            &selection,
         )?;
         let capacity = match bounds {
             Some(_) => 0,
