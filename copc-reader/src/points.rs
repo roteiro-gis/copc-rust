@@ -47,6 +47,15 @@ pub enum BoundsSelection {
     Within(Bounds),
 }
 
+impl BoundsSelection {
+    pub(crate) fn filter(self) -> Option<Bounds> {
+        match self {
+            Self::All => None,
+            Self::Within(bounds) => Some(bounds),
+        }
+    }
+}
+
 /// Point query used by [`CopcReader::points_for_query`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointQuery {
@@ -152,78 +161,32 @@ impl<R: Read + Seek + Send> CopcReader<R> {
     ) -> Result<LasColumnBatch> {
         let chunks = select_point_chunks(&self.file, query)?;
         let point_format = self.file.point_format()?;
+        let bounds = query.bounds.filter();
         let decoder = ChunkColumnDecoder::new(
             self.file.laszip_vlr().clone(),
             point_format,
             self.file.transforms(),
-            match query.bounds {
-                BoundsSelection::All => None,
-                BoundsSelection::Within(bounds) => Some(bounds),
-            },
+            bounds,
             &selection,
         )?;
-
-        let capacity = match decoder.bounds {
+        let capacity = match bounds {
             Some(_) => 0,
             None => total_candidate_points(&chunks)?.min(MAX_INITIAL_COLUMN_RESERVE_POINTS),
         };
-        let mut columns = selected_column_builders(point_format, selection.clone(), capacity)?;
+        let mut columns = selected_column_builders(point_format, selection, capacity)?;
         let mut accepted_points = 0usize;
-
-        #[cfg(not(feature = "parallel"))]
-        {
-            let mut chunk_bytes = Vec::new();
-            for entry in chunks {
-                if let Some(cancel) = cancel {
-                    cancel.check()?;
-                }
-                let points_in_chunk = read_chunk_bytes(&mut self.source, entry, &mut chunk_bytes)?;
-                accepted_points +=
-                    decoder.decode_into(&chunk_bytes, points_in_chunk, &mut columns, cancel)?;
+        let mut buffers: Vec<Vec<u8>> = Vec::new();
+        for batch in chunks.chunks(decode_batch_chunks()) {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
             }
-        }
-
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-
-            type DecodedChunk = Result<(Vec<(ColumnSpec, ColumnData)>, usize)>;
-
-            let batch_size = rayon::current_num_threads().max(1) * 2;
-            for batch in chunks.chunks(batch_size) {
-                if let Some(cancel) = cancel {
-                    cancel.check()?;
-                }
-                let mut batch_bytes = Vec::with_capacity(batch.len());
-                for entry in batch {
-                    let mut chunk_bytes = Vec::new();
-                    let points_in_chunk =
-                        read_chunk_bytes(&mut self.source, *entry, &mut chunk_bytes)?;
-                    batch_bytes.push((chunk_bytes, points_in_chunk));
-                }
-                let decoded: Vec<DecodedChunk> = batch_bytes
-                    .par_iter()
-                    .map(|(chunk_bytes, points_in_chunk)| {
-                        let mut chunk_columns = selected_column_builders(
-                            point_format,
-                            selection.clone(),
-                            (*points_in_chunk).min(MAX_INITIAL_COLUMN_RESERVE_POINTS),
-                        )?;
-                        let accepted = decoder.decode_into(
-                            chunk_bytes,
-                            *points_in_chunk,
-                            &mut chunk_columns,
-                            None,
-                        )?;
-                        Ok((chunk_columns, accepted))
-                    })
-                    .collect();
-                for result in decoded {
-                    let (chunk_columns, accepted) = result?;
-                    merge_columns(&mut columns, chunk_columns)?;
-                    accepted_points += accepted;
-                }
+            buffers.resize_with(batch.len(), Vec::new);
+            let mut counts = Vec::with_capacity(batch.len());
+            for (entry, buffer) in batch.iter().zip(&mut buffers) {
+                counts.push(read_chunk_bytes(&mut self.source, *entry, buffer)?);
             }
+            let encoded: Vec<_> = buffers.iter().map(Vec::as_slice).zip(counts).collect();
+            accepted_points += decoder.decode_batch(&encoded, &mut columns, cancel)?;
         }
 
         let batch = LasColumnBatch {
@@ -232,6 +195,19 @@ impl<R: Read + Seek + Send> CopcReader<R> {
         };
         batch.validate()?;
         Ok(batch)
+    }
+}
+
+/// Chunks decoded per batch: one at a time sequentially, or enough to keep
+/// every rayon worker busy with the `parallel` feature.
+pub(crate) fn decode_batch_chunks() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        rayon::current_num_threads().max(1) * 2
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
     }
 }
 
@@ -331,6 +307,58 @@ impl ChunkColumnDecoder {
 
             append_columns(columns, &point_buf, &self.layout, (x, y, z))?;
             accepted += 1;
+        }
+        Ok(accepted)
+    }
+
+    /// Decode `chunks` (compressed bytes and point count each) in order,
+    /// appending to `columns`; returns the number of points accepted. With
+    /// the `parallel` feature, chunks decode concurrently into per-chunk
+    /// builders that are then appended in order. `cancel` is polled between
+    /// chunks, and within chunks when decoding sequentially.
+    pub(crate) fn decode_batch(
+        &self,
+        chunks: &[(&[u8], usize)],
+        columns: &mut [(ColumnSpec, ColumnData)],
+        cancel: Option<&dyn CancelCheck>,
+    ) -> Result<usize> {
+        #[cfg(feature = "parallel")]
+        if chunks.len() > 1 {
+            use rayon::prelude::*;
+
+            type DecodedChunk = Result<(Vec<(ColumnSpec, ColumnData)>, usize)>;
+
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
+            let decoded: Vec<DecodedChunk> = chunks
+                .par_iter()
+                .map(|&(bytes, points)| {
+                    let mut chunk_columns = columns
+                        .iter()
+                        .map(|(spec, _)| {
+                            empty_column(*spec, points.min(MAX_INITIAL_COLUMN_RESERVE_POINTS))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let accepted = self.decode_into(bytes, points, &mut chunk_columns, None)?;
+                    Ok((chunk_columns, accepted))
+                })
+                .collect();
+            let mut accepted = 0usize;
+            for result in decoded {
+                let (chunk_columns, chunk_accepted) = result?;
+                merge_columns(columns, chunk_columns)?;
+                accepted += chunk_accepted;
+            }
+            return Ok(accepted);
+        }
+
+        let mut accepted = 0usize;
+        for &(bytes, points) in chunks {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
+            accepted += self.decode_into(bytes, points, columns, cancel)?;
         }
         Ok(accepted)
     }
@@ -892,10 +920,7 @@ impl<'a, R: Read + Seek + Send> QuerySetup<'a, R> {
         let chunks = select_point_chunks(file, query)?;
         let point_format = file.point_format()?;
         let transforms = file.transforms();
-        let bounds = match query.bounds {
-            BoundsSelection::All => None,
-            BoundsSelection::Within(bounds) => Some(bounds),
-        };
+        let bounds = query.bounds.filter();
         let decoder = ChunkLazDecoder::new(source, file.laszip_vlr().clone())?;
         let record_size = usize::from(point_format.len());
         if decoder.record_size() != record_size {
@@ -1053,10 +1078,7 @@ where
 {
     validate_query(query)?;
     let (level_min, level_max) = level_range(query.lod, info)?;
-    let query_bounds = match query.bounds {
-        BoundsSelection::All => None,
-        BoundsSelection::Within(bounds) => Some(bounds),
-    };
+    let query_bounds = query.bounds.filter();
 
     let mut chunks = Vec::new();
     for entry in entries {
