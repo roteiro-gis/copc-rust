@@ -18,11 +18,14 @@ fn lod_index_and_spill_remain_disk_backed() {
     assert_contains(lod_src, "fn partition_index_run");
     assert_contains(lod_src, "new_index_tempfile(\"root\")");
     assert_contains(lod_src, "new_index_tempfile(\"partition\")");
-    assert_contains(lod_src, "open_index_run(run)?");
+    assert_contains(lod_src, "run.for_each(");
     assert_contains(lod_src, "append_index_to_order(");
     assert_not_contains(lod_src, "Vec<LasPointRecord>");
     assert_not_contains(lod_src, "Vec<CopcPointFields>");
-    assert_not_contains(lod_src, "Vec<u32>");
+    // The only in-memory index lists are the per-node representatives, which
+    // are capped at `max_points_per_node`.
+    assert_eq!(1, lod_src.matches("Vec<u32>").count());
+    assert_contains(lod_src, "exclude: Vec<u32>");
     assert_not_contains(writer_src, "Vec<LasPointRecord>");
     assert_not_contains(writer_src, "Vec<CopcPointFields>");
     assert_not_contains(writer_src, "Vec<u32>");

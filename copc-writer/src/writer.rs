@@ -20,7 +20,7 @@ use crate::las_out::{
     regular_las_vlrs_bytes, write_evlr_header, write_las_evlr, write_las_vlr, write_vlr_header,
     LasHeader, LAS_EVLR_HEADER_BYTES, LAS_VLR_HEADER_BYTES,
 };
-use crate::lod::{build_lod_index, cube_from_bounds, INDEX_IO_BUFFER_BYTES};
+use crate::lod::{build_lod_index, cube_from_bounds, lod_spacing, INDEX_IO_BUFFER_BYTES};
 use crate::metadata::{
     read_all_source_evlrs, CopcWriteMetadata, OutputLasMetadata, LASZIP_VLR_RECORD_ID,
     LASZIP_VLR_USER_ID,
@@ -474,7 +474,7 @@ fn write_copc_inner<S: CopcPointSource>(
     let info = CopcInfo {
         center,
         halfsize,
-        spacing: halfsize / 128.0,
+        spacing: lod_spacing(halfsize),
         root_hier_offset,
         root_hier_size: hierarchy_pages.byte_size,
         gpstime_min: point_stats.gpstime_min,
