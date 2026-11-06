@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## 0.10.0-rc.1 - 2026-11-05
+
+This release candidate fixes coarse-LOD quality in generated files, speeds
+up column reads, brings `CopcRangeReader` to parity with `CopcReader`, and
+adds PDRF 8 (RGB + NIR) output.
+
+### Breaking
+
+- `CopcPointFields` gains a `nir: u16` field; exhaustive struct literals
+  need `nir` (or `..Default::default()`)
+- column reads report `Classification` as the stored byte. Class 12 used to
+  read as class 1, with `Overlap` taken only from the flag bit, so stored
+  class 12 values were lost. Downstream code that relied on that
+  remapping must handle class 12 itself. Row iteration (`las::Point`) is
+  unchanged.
+
+### Fixed
+
+- interior octree nodes now keep one representative per occupied cell of
+  the finest power-of-two voxel grid (up to 256 cells per axis) that fits
+  `max_points_per_node`, instead of the first points of each octant in input
+  order; coarse LODs of scan-ordered input now cover the whole node instead
+  of a few strips
+- `ColumnBatchSource::fields_into` returns an error for out-of-range indexes
+  instead of panicking
+
+### Added
+
+- the writer emits LAS point format 8 when a source reports
+  `CopcPointSource::has_nir`; streaming conversion of PDRF 8 input and
+  `ColumnBatchSource` `Nir` columns are supported (NIR requires RGB)
+- `CopcRangeReader::read_columns_with_cancel` and `read_points_with_cancel`
+
+### Performance
+
+- column reads decode only the LAZ layers the requested dimensions need
+  (plus Z when filtering by bounds); xyz-only reads are about 2.4x faster
+- with the `parallel` feature, `CopcRangeReader` decodes chunks
+  concurrently, batching small non-adjacent range groups; both readers share
+  one decode path
+
 ## 0.9.0 - 2026-07-23
 
 This release hardens every untrusted-input boundary, makes writer failures
