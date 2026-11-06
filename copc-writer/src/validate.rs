@@ -42,21 +42,17 @@ impl PointStats {
 }
 
 pub(crate) fn validate_streaming_layout_supported(layout: &StreamingLayout) -> Result<()> {
-    let mut unsupported = Vec::new();
-    if layout.has_nir {
-        unsupported.push("NIR point data".to_string());
-    }
     if layout.has_waveform {
-        unsupported.push("waveform point data".to_string());
+        return Err(Error::Unsupported(
+            "COPC writer cannot preserve waveform point data".into(),
+        ));
     }
-    if unsupported.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Unsupported(format!(
-            "COPC writer cannot preserve {}",
-            unsupported.join(", ")
-        )))
+    if layout.has_nir && !layout.has_color {
+        return Err(Error::InvalidInput(
+            "NIR point data requires RGB (LAS point format 8)".into(),
+        ));
     }
+    Ok(())
 }
 
 pub(crate) fn validate_las_conversion_supported(
@@ -72,9 +68,6 @@ pub(crate) fn validate_las_conversion_supported(
     }
     let mut unsupported = Vec::new();
     let format = header.point_format();
-    if format.has_nir {
-        unsupported.push("NIR point data".to_string());
-    }
     if format.has_waveform {
         unsupported.push("waveform point data".to_string());
     }
