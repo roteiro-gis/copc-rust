@@ -15,6 +15,9 @@ pub enum LasDimension {
     Intensity,
     ReturnNumber,
     NumberOfReturns,
+    /// Classification byte as stored. Point formats 6-10 carry overlap in
+    /// the separate [`LasDimension::Overlap`] flag, so class 12 is not
+    /// reinterpreted.
     Classification,
     ScanDirectionFlag,
     EdgeOfFlightLine,
