@@ -472,6 +472,7 @@ mod tests {
                 red: 0,
                 green: 0,
                 blue: 0,
+                nir: 0,
                 extra_bytes: Vec::new(),
             })
             .collect();
@@ -526,6 +527,7 @@ mod tests {
             red: 0,
             green: 0,
             blue: 0,
+            nir: 0,
             extra_bytes: Vec::new(),
         };
         // 4000 distinct points packed into a ~0.4-unit cluster ...

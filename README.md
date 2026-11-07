@@ -151,7 +151,7 @@ behind a future optional feature.
 - Streaming conversion can accept caller-resolved WKT for GeoTIFF-only CRS
   inputs without adding a geodesy dependency to `copc-writer`
 - Reading LAS 1.4 point formats 6, 7, and 8 with LAZ variable-size chunks
-- Writing LAS 1.4 point formats 6 and 7 with LAZ variable-size chunks
+- Writing LAS 1.4 point formats 6, 7, and 8 (RGB + NIR) with LAZ variable-size chunks
 - Interior-node representative points for native LOD reads
 - Lazy remote reads over byte-range sources (`CopcRangeReader`, `RangeRead`,
   optional HTTP source) with on-demand hierarchy loading and coalesced chunk
