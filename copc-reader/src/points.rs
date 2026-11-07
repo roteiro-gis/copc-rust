@@ -9,7 +9,7 @@ use copc_core::{
 use las::point::Format as LasPointFormat;
 use las::{Point, Transform, Vector};
 use laz::record::{LayeredPointRecordDecompressor, RecordDecompressor};
-use laz::LazVlr;
+use laz::{DecompressionSelection, LazVlr};
 
 use crate::{CopcFile, LasHeader};
 
@@ -160,6 +160,7 @@ impl<R: Read + Seek + Send> CopcReader<R> {
                 BoundsSelection::All => None,
                 BoundsSelection::Within(bounds) => Some(bounds),
             },
+            &selection,
         )?;
 
         let capacity = match decoder.bounds {
@@ -270,6 +271,7 @@ pub(crate) struct ChunkColumnDecoder {
     layout: ExtendedPointLayout,
     transforms: Vector<Transform>,
     bounds: Option<Bounds>,
+    layers: DecompressionSelection,
     record_size: usize,
 }
 
@@ -279,6 +281,7 @@ impl ChunkColumnDecoder {
         point_format: LasPointFormat,
         transforms: Vector<Transform>,
         bounds: Option<Bounds>,
+        selection: &ColumnSelection,
     ) -> Result<Self> {
         let layout = ExtendedPointLayout::for_format(&point_format)?;
         let record_size = validated_record_size(&laz_vlr, &point_format)?;
@@ -286,6 +289,7 @@ impl ChunkColumnDecoder {
             laz_vlr,
             layout,
             transforms,
+            layers: decompression_layers(selection, bounds.is_some()),
             bounds,
             record_size,
         })
@@ -303,6 +307,7 @@ impl ChunkColumnDecoder {
     ) -> Result<usize> {
         let mut decompressor = LayeredPointRecordDecompressor::new(Cursor::new(chunk_bytes));
         configure_layered_decompressor(&mut decompressor, &self.laz_vlr)?;
+        decompressor.set_selection(self.layers);
         let mut point_buf = vec![0u8; self.record_size];
         let mut accepted = 0usize;
         for decoded in 0..points_in_chunk {
@@ -368,6 +373,51 @@ pub(crate) fn decode_chunk_points(
         out.push(Point::new(raw_point, transforms));
     }
     Ok(())
+}
+
+/// LAZ layers needed to fill `selection`. LAS 1.4 chunks compress each field
+/// group as its own layer, so skipped layers are never entropy-decoded; bytes
+/// for skipped fields in the record buffer are left unspecified and must not
+/// be read. X, Y, return numbers, and scanner channel are always decoded, and
+/// a bounds filter also needs Z.
+fn decompression_layers(
+    selection: &ColumnSelection,
+    filter_bounds: bool,
+) -> DecompressionSelection {
+    let mut layers = DecompressionSelection::base();
+    if filter_bounds {
+        layers = layers.decompress_z();
+    }
+    for dimension in selection.dimensions() {
+        layers = match dimension {
+            LasDimension::X
+            | LasDimension::Y
+            | LasDimension::ReturnNumber
+            | LasDimension::NumberOfReturns
+            | LasDimension::ScanChannel => layers,
+            LasDimension::Z => layers.decompress_z(),
+            LasDimension::Classification => layers.decompress_classification(),
+            LasDimension::ScanDirectionFlag
+            | LasDimension::EdgeOfFlightLine
+            | LasDimension::Synthetic
+            | LasDimension::KeyPoint
+            | LasDimension::Withheld
+            | LasDimension::Overlap => layers.decompress_flags(),
+            LasDimension::Intensity => layers.decompress_intensity(),
+            LasDimension::ScanAngle => layers.decompress_scan_angle(),
+            LasDimension::UserData => layers.decompress_user_data(),
+            LasDimension::PointSourceId => layers.decompress_point_source_id(),
+            LasDimension::GpsTime => layers.decompress_gps_time(),
+            LasDimension::Red | LasDimension::Green | LasDimension::Blue => layers.decompress_rgb(),
+            LasDimension::Nir => layers.decompress_nir(),
+            LasDimension::WaveformPacketDescriptorIndex
+            | LasDimension::WaveformPacketByteOffset
+            | LasDimension::WaveformPacketSize
+            | LasDimension::WavePacketReturnPointWaveformLocation => layers.decompress_wavepacket(),
+            LasDimension::ExtraBytes => layers.decompress_extra_bytes(),
+        };
+    }
+    layers
 }
 
 /// Validates the LASzip item layout against the LAS point record length and
