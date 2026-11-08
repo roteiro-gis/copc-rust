@@ -8,14 +8,14 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 
 use copc_core::{
-    ColumnSelection, CopcInfo, Entry, EntryAvailability, Error, HierarchyPage, LasColumnBatch,
-    Result, VoxelKey,
+    CancelCheck, ColumnSelection, CopcInfo, Entry, EntryAvailability, Error, HierarchyPage,
+    LasColumnBatch, Result, VoxelKey,
 };
 use las::Point;
 use laz::LazVlr;
 
 use crate::points::{
-    decode_chunk_points, select_point_chunks_from, selected_column_builders,
+    decode_batch_chunks, decode_chunk_points, select_point_chunks_from, selected_column_builders,
     total_candidate_points, validate_query, voxel_bounds, BoundsSelection, ChunkColumnDecoder,
     PointQuery, MAX_INITIAL_COLUMN_RESERVE_POINTS,
 };
@@ -190,8 +190,16 @@ impl<S: RangeRead> CopcRangeReader<S> {
     /// Point-data hierarchy entries matching `query`, loading any hierarchy
     /// pages the query can reach that have not been fetched yet.
     pub fn hierarchy_for(&mut self, query: PointQuery) -> Result<Vec<Entry>> {
+        self.hierarchy_for_inner(query, None)
+    }
+
+    fn hierarchy_for_inner(
+        &mut self,
+        query: PointQuery,
+        cancel: Option<&dyn CancelCheck>,
+    ) -> Result<Vec<Entry>> {
         validate_query(query)?;
-        self.ensure_hierarchy_for(query)?;
+        self.ensure_hierarchy_for(query, cancel)?;
         select_point_chunks_from(self.hierarchy.values(), &self.copc_info, query)
     }
 
@@ -201,12 +209,29 @@ impl<S: RangeRead> CopcRangeReader<S> {
         query: PointQuery,
         selection: ColumnSelection,
     ) -> Result<LasColumnBatch> {
-        let chunks = self.hierarchy_for(query)?;
+        self.read_columns_inner(query, selection, None)
+    }
+
+    /// [`Self::read_columns`], polling `cancel` between range requests and
+    /// while decoding.
+    pub fn read_columns_with_cancel(
+        &mut self,
+        query: PointQuery,
+        selection: ColumnSelection,
+        cancel: &dyn CancelCheck,
+    ) -> Result<LasColumnBatch> {
+        self.read_columns_inner(query, selection, Some(cancel))
+    }
+
+    fn read_columns_inner(
+        &mut self,
+        query: PointQuery,
+        selection: ColumnSelection,
+        cancel: Option<&dyn CancelCheck>,
+    ) -> Result<LasColumnBatch> {
+        let chunks = self.hierarchy_for_inner(query, cancel)?;
         let point_format = point_format_for(&self.header)?;
-        let bounds = match query.bounds {
-            BoundsSelection::All => None,
-            BoundsSelection::Within(bounds) => Some(bounds),
-        };
+        let bounds = query.bounds.filter();
         let decoder = ChunkColumnDecoder::new(
             self.laszip_vlr.clone(),
             point_format,
@@ -220,13 +245,37 @@ impl<S: RangeRead> CopcRangeReader<S> {
         };
         let mut columns = selected_column_builders(point_format, selection, capacity)?;
         let mut accepted_points = 0usize;
-        for group in coalesce_chunks(&chunks, RANGE_COALESCE_GAP_BYTES, MAX_COALESCED_RANGE_BYTES) {
-            let bytes = self.fetch_range(group.start, group.end)?;
-            for entry in group.entries {
-                let (slice, points_in_chunk) = chunk_slice(&bytes, group.start, entry)?;
-                accepted_points +=
-                    decoder.decode_into(slice, points_in_chunk, &mut columns, None)?;
+        let groups = coalesce_chunks(&chunks, RANGE_COALESCE_GAP_BYTES, MAX_COALESCED_RANGE_BYTES);
+        let group_count = groups.len();
+        // Fetch groups until there are enough chunks (or bytes) for one
+        // decode batch, so the `parallel` feature can decode across small,
+        // non-adjacent groups too.
+        let batch_chunks = decode_batch_chunks();
+        let mut pending: Vec<(Vec<u8>, ChunkGroup)> = Vec::new();
+        let mut pending_chunks = 0usize;
+        let mut pending_bytes = 0u64;
+        for (index, group) in groups.into_iter().enumerate() {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
             }
+            let bytes = self.fetch_range(group.start, group.end)?;
+            pending_chunks += group.entries.len();
+            pending_bytes += group.end - group.start;
+            pending.push((bytes, group));
+            let last = index + 1 == group_count;
+            if !last && pending_chunks < batch_chunks && pending_bytes < MAX_COALESCED_RANGE_BYTES {
+                continue;
+            }
+            let mut encoded = Vec::with_capacity(pending_chunks);
+            for (bytes, group) in &pending {
+                for entry in &group.entries {
+                    encoded.push(chunk_slice(bytes, group.start, *entry)?);
+                }
+            }
+            accepted_points += decoder.decode_batch(&encoded, &mut columns, cancel)?;
+            pending.clear();
+            pending_chunks = 0;
+            pending_bytes = 0;
         }
         let batch = LasColumnBatch {
             len: accepted_points,
@@ -238,19 +287,36 @@ impl<S: RangeRead> CopcRangeReader<S> {
 
     /// Materialized row read over the chunks selected by `query`.
     pub fn read_points(&mut self, query: PointQuery) -> Result<Vec<Point>> {
-        let chunks = self.hierarchy_for(query)?;
+        self.read_points_inner(query, None)
+    }
+
+    /// [`Self::read_points`], polling `cancel` between range requests.
+    pub fn read_points_with_cancel(
+        &mut self,
+        query: PointQuery,
+        cancel: &dyn CancelCheck,
+    ) -> Result<Vec<Point>> {
+        self.read_points_inner(query, Some(cancel))
+    }
+
+    fn read_points_inner(
+        &mut self,
+        query: PointQuery,
+        cancel: Option<&dyn CancelCheck>,
+    ) -> Result<Vec<Point>> {
+        let chunks = self.hierarchy_for_inner(query, cancel)?;
         let point_format = point_format_for(&self.header)?;
         let transforms = transforms_for(&self.header);
-        let bounds = match query.bounds {
-            BoundsSelection::All => None,
-            BoundsSelection::Within(bounds) => Some(bounds),
-        };
+        let bounds = query.bounds.filter();
         let capacity = match bounds {
             Some(_) => 0,
             None => total_candidate_points(&chunks)?.min(MAX_INITIAL_COLUMN_RESERVE_POINTS),
         };
         let mut points = Vec::with_capacity(capacity);
         for group in coalesce_chunks(&chunks, RANGE_COALESCE_GAP_BYTES, MAX_COALESCED_RANGE_BYTES) {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             let bytes = self.fetch_range(group.start, group.end)?;
             for entry in group.entries {
                 let (slice, points_in_chunk) = chunk_slice(&bytes, group.start, entry)?;
@@ -280,7 +346,11 @@ impl<S: RangeRead> CopcRangeReader<S> {
     }
 
     /// Loads every pending hierarchy page whose subtree the query can reach.
-    fn ensure_hierarchy_for(&mut self, query: PointQuery) -> Result<()> {
+    fn ensure_hierarchy_for(
+        &mut self,
+        query: PointQuery,
+        cancel: Option<&dyn CancelCheck>,
+    ) -> Result<()> {
         loop {
             let mut relevant = Vec::new();
             let mut rest = Vec::new();
@@ -296,6 +366,9 @@ impl<S: RangeRead> CopcRangeReader<S> {
                 return Ok(());
             }
             for entry in relevant {
+                if let Some(cancel) = cancel {
+                    cancel.check()?;
+                }
                 self.load_page(entry)?;
             }
         }

@@ -3,7 +3,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use copc_core::{Bounds, ColumnData, ColumnSelection, CopcInfo, Entry, HierarchyPage, VoxelKey};
+use copc_core::{
+    Bounds, CancelCheck, ColumnData, ColumnSelection, CopcInfo, Entry, HierarchyPage, VoxelKey,
+};
 use copc_reader::{
     BoundsSelection, CopcRangeReader, CopcReader, LasColumnBatch, LasDimension, LodSelection,
     PointQuery, RangeRead,
@@ -221,6 +223,64 @@ fn ranged_reader_matches_seek_reader() {
     assert_eq!(expected_columns.len(), columns.len());
     assert_sorted_column_eq(&expected_columns, &columns, LasDimension::GpsTime);
     assert_sorted_column_eq(&expected_columns, &columns, LasDimension::X);
+}
+
+#[test]
+fn ranged_columns_match_seek_reader_exactly() {
+    let bytes = synthetic_copc_bytes(5_000);
+    let corner = Bounds::new((0.0, 0.0, 0.0), (120.0, 90.0, 63.0));
+    let mut ranged = CopcRangeReader::open(RecordingSource::new(bytes.clone())).unwrap();
+    for query in [
+        PointQuery::all(),
+        PointQuery::new(LodSelection::All, BoundsSelection::Within(corner)),
+        PointQuery::new(LodSelection::LevelMinMax(1, 3), BoundsSelection::All),
+    ] {
+        let mut seek_reader = CopcReader::open(std::io::Cursor::new(bytes.clone())).unwrap();
+        let expected = seek_reader
+            .read_columns(query, ColumnSelection::all())
+            .unwrap();
+        let actual = ranged.read_columns(query, ColumnSelection::all()).unwrap();
+        assert!(!expected.is_empty());
+        assert_eq!(expected, actual, "{query:?}");
+    }
+}
+
+#[test]
+fn ranged_reads_stop_when_cancelled() {
+    struct CancelAfter(std::cell::Cell<usize>);
+
+    impl CancelCheck for CancelAfter {
+        fn check(&self) -> copc_core::Result<()> {
+            match self.0.get() {
+                0 => Err(copc_core::Error::Cancelled),
+                remaining => {
+                    self.0.set(remaining - 1);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    let bytes = synthetic_copc_bytes(5_000);
+    let mut ranged = CopcRangeReader::open(RecordingSource::new(bytes)).unwrap();
+    let columns = ranged.read_columns_with_cancel(
+        PointQuery::all(),
+        ColumnSelection::xyz(),
+        &CancelAfter(std::cell::Cell::new(1)),
+    );
+    assert!(matches!(columns, Err(copc_core::Error::Cancelled)));
+    let points =
+        ranged.read_points_with_cancel(PointQuery::all(), &CancelAfter(std::cell::Cell::new(0)));
+    assert!(matches!(points, Err(copc_core::Error::Cancelled)));
+
+    let complete = ranged
+        .read_columns_with_cancel(
+            PointQuery::all(),
+            ColumnSelection::xyz(),
+            &copc_core::NeverCancel,
+        )
+        .unwrap();
+    assert_eq!(5_000, complete.len());
 }
 
 fn assert_sorted_column_eq(
