@@ -206,6 +206,109 @@ fn column_batch_source_writes_columns_readable_by_reader() {
     }
 }
 
+/// Column reads decode only the LAZ layers their dimensions need; every
+/// single-dimension read must still match the full-record row decoder.
+#[test]
+fn single_dimension_reads_match_rows() {
+    struct ExtraBytesSource(VecSource);
+
+    impl CopcPointSource for ExtraBytesSource {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn xyz(&self, index: usize) -> copc_core::Result<(f64, f64, f64)> {
+            self.0.xyz(index)
+        }
+
+        fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> copc_core::Result<()> {
+            self.0.fields_into(index, out)?;
+            out.extra_bytes = vec![index as u8, (index >> 8) as u8, 0xA5];
+            Ok(())
+        }
+
+        fn extra_byte_count(&self) -> u16 {
+            3
+        }
+    }
+
+    let source = ExtraBytesSource(VecSource {
+        points: grid_points(1_000),
+    });
+    let bounds = source_bounds(&source.0.points);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("selective.copc.laz");
+    write_source(
+        &path,
+        &source,
+        true,
+        bounds,
+        &CopcWriterParams::new(128),
+        &CopcWriteMetadata::default(),
+    )
+    .unwrap();
+
+    let sub_bounds = Bounds::new((-8.0, -9.0, -11.5), (9.0, 7.0, -9.5));
+    for query in [
+        PointQuery::all(),
+        PointQuery::new(LodSelection::All, BoundsSelection::Within(sub_bounds)),
+    ] {
+        // Rows come from the full-record decoder, independent of column
+        // layer selection.
+        let rows = read_rows(&path, query);
+        assert!(!rows.is_empty());
+        let dimensions = read_columns(&path, query, ColumnSelection::all())
+            .columns
+            .into_iter()
+            .map(|(spec, _)| spec.dimension);
+        for dimension in dimensions {
+            let single = read_columns(&path, query, ColumnSelection::from_dimensions([dimension]));
+            assert_eq!(rows.len(), single.len(), "{dimension:?}");
+            assert_eq!(
+                Some(&expected_column(dimension, &rows)),
+                single.column(dimension),
+                "{dimension:?} single-dimension read differs from rows for {query:?}"
+            );
+        }
+    }
+}
+
+fn expected_column(dimension: LasDimension, rows: &[las::Point]) -> ColumnData {
+    let f64s = |value: fn(&las::Point) -> f64| ColumnData::F64(rows.iter().map(value).collect());
+    let u16s = |value: fn(&las::Point) -> u16| ColumnData::U16(rows.iter().map(value).collect());
+    let u8s = |value: fn(&las::Point) -> u8| ColumnData::U8(rows.iter().map(value).collect());
+    let bools = |value: fn(&las::Point) -> bool| ColumnData::Bool(rows.iter().map(value).collect());
+    match dimension {
+        LasDimension::X => f64s(|p| p.x),
+        LasDimension::Y => f64s(|p| p.y),
+        LasDimension::Z => f64s(|p| p.z),
+        LasDimension::Intensity => u16s(|p| p.intensity),
+        LasDimension::ReturnNumber => u8s(|p| p.return_number),
+        LasDimension::NumberOfReturns => u8s(|p| p.number_of_returns),
+        LasDimension::Classification => u8s(|p| u8::from(p.classification)),
+        LasDimension::ScanDirectionFlag => {
+            bools(|p| matches!(p.scan_direction, las::point::ScanDirection::LeftToRight))
+        }
+        LasDimension::EdgeOfFlightLine => bools(|p| p.is_edge_of_flight_line),
+        LasDimension::ScanAngle => ColumnData::F32(rows.iter().map(|p| p.scan_angle).collect()),
+        LasDimension::UserData => u8s(|p| p.user_data),
+        LasDimension::PointSourceId => u16s(|p| p.point_source_id),
+        LasDimension::Synthetic => bools(|p| p.is_synthetic),
+        LasDimension::KeyPoint => bools(|p| p.is_key_point),
+        LasDimension::Withheld => bools(|p| p.is_withheld),
+        LasDimension::Overlap => bools(|p| p.is_overlap),
+        LasDimension::ScanChannel => u8s(|p| p.scanner_channel),
+        LasDimension::GpsTime => f64s(|p| p.gps_time.unwrap()),
+        LasDimension::Red => u16s(|p| p.color.unwrap().red),
+        LasDimension::Green => u16s(|p| p.color.unwrap().green),
+        LasDimension::Blue => u16s(|p| p.color.unwrap().blue),
+        LasDimension::ExtraBytes => {
+            ColumnData::U8(rows.iter().flat_map(|p| p.extra_bytes.clone()).collect())
+        }
+        other => panic!("no row reference for {other:?}"),
+    }
+}
+
 fn read_rows(path: &std::path::Path, query: PointQuery) -> Vec<las::Point> {
     let mut reader = CopcReader::from_path(path).unwrap();
     reader

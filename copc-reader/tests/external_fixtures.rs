@@ -61,6 +61,23 @@ fn assert_fixture(path: &Path) {
         .unwrap();
     assert_columns_match_points(&columns, &all_points);
 
+    for (spec, expected) in &columns.columns {
+        let mut reader = CopcReader::from_path(path).unwrap();
+        let single = reader
+            .read_columns(
+                PointQuery::all(),
+                ColumnSelection::from_dimensions([spec.dimension]),
+            )
+            .unwrap();
+        assert_eq!(
+            Some(expected),
+            single.column(spec.dimension),
+            "{} {:?} single-dimension read differs from the full read",
+            path.display(),
+            spec.dimension
+        );
+    }
+
     let full_bounds = Bounds::new(
         (header.min_x, header.min_y, header.min_z),
         (header.max_x, header.max_y, header.max_z),
