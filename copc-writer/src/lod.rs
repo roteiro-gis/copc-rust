@@ -1,7 +1,9 @@
 //! Disk-backed LOD octree index construction for COPC writes.
 
+use std::collections::hash_map::{Entry, HashMap};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -21,6 +23,9 @@ pub(crate) const INDEX_IO_BUFFER_BYTES: usize = 1024 * 1024;
 /// Pathological coincident inputs that cannot fit by this depth are rejected
 /// rather than producing an oversized chunk.
 const MAX_OCTREE_DEPTH: u32 = 30;
+/// Interior nodes select representatives on grids of up to `2^8 = 256` cells
+/// per axis; see [`GridSampler`].
+const LOD_GRID_MAX_LEVEL: u32 = 8;
 
 pub(crate) struct LodIndex {
     pub(crate) nodes: Vec<LodNodeRange>,
@@ -34,10 +39,48 @@ pub(crate) struct LodNodeRange {
     pub(crate) count: usize,
 }
 
+/// A temporary file of ascending source indexes, minus the sorted `exclude`
+/// indexes that an ancestor node already took as representatives.
 struct IndexRun {
     path: TempPath,
-    start: u64,
-    count: usize,
+    records: usize,
+    exclude: Vec<u32>,
+}
+
+impl IndexRun {
+    fn len(&self) -> usize {
+        self.records - self.exclude.len()
+    }
+
+    /// Visit every index in the run that is not excluded, in ascending order.
+    fn for_each(
+        &self,
+        cancel: &dyn CancelCheck,
+        mut visit: impl FnMut(u32) -> Result<()>,
+    ) -> Result<()> {
+        let path: &Path = self.path.as_ref();
+        let file = File::open(path).map_err(|e| Error::io("open LOD index", e))?;
+        let mut reader = BufReader::with_capacity(INDEX_IO_BUFFER_BYTES, file);
+        let mut excluded = self.exclude.iter().copied().peekable();
+        for read_index in 0..self.records {
+            if read_index.is_multiple_of(CANCEL_POLL_STRIDE) {
+                cancel.check()?;
+            }
+            let index = reader
+                .read_u32::<LittleEndian>()
+                .map_err(|e| Error::io("read LOD index", e))?;
+            if excluded.next_if_eq(&index).is_some() {
+                continue;
+            }
+            visit(index)?;
+        }
+        if excluded.next().is_some() {
+            return Err(Error::InvalidData(
+                "LOD index exclusions are not a subset of their run".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn build_lod_index<S: CopcPointSource>(
@@ -84,6 +127,12 @@ pub(crate) fn build_lod_index<S: CopcPointSource>(
     })
 }
 
+/// COPC spacing for an octree whose root cube has `halfsize`: the cell size
+/// of the finest grid used to select root representatives.
+pub(crate) fn lod_spacing(halfsize: f64) -> f64 {
+    2.0 * halfsize / f64::from(1u32 << LOD_GRID_MAX_LEVEL)
+}
+
 struct LodIndexBuilder<'a, S: CopcPointSource, W: Write> {
     source: &'a S,
     max_points_per_node: usize,
@@ -96,57 +145,57 @@ struct LodIndexBuilder<'a, S: CopcPointSource, W: Write> {
 impl<S: CopcPointSource, W: Write> LodIndexBuilder<'_, S, W> {
     fn assign(&mut self, key: VoxelKey, run: IndexRun, bounds: Bounds) -> Result<()> {
         self.cancel.check()?;
-        if run.count == 0 {
+        let count = run.len();
+        if count == 0 {
             return Ok(());
         }
-        if run.count <= self.max_points_per_node {
-            let start = *self.order_offset;
-            append_index_run_to_order(&run, self.order_writer, self.order_offset, self.cancel)?;
-            self.nodes.push(LodNodeRange {
-                key,
-                start,
-                count: run.count,
-            });
+        let start = *self.order_offset;
+        if count <= self.max_points_per_node {
+            let (order_writer, order_offset) = (&mut *self.order_writer, &mut *self.order_offset);
+            run.for_each(self.cancel, |index| {
+                append_index_to_order(order_writer, order_offset, index)
+            })?;
+            self.nodes.push(LodNodeRange { key, start, count });
             return Ok(());
         }
         if key.level as u32 >= MAX_OCTREE_DEPTH {
             return Err(Error::InvalidInput(format!(
-                "octree node {key:?} still contains {} points at the maximum depth; increase max_points_per_node above {}",
-                run.count, self.max_points_per_node
+                "octree node {key:?} still contains {count} points at the maximum depth; increase max_points_per_node above {}",
+                self.max_points_per_node
             )));
         }
 
-        let mut children = partition_index_run(self.source, &run, bounds, self.cancel)?;
-        let start = *self.order_offset;
-        let selected_counts = append_lod_selection_to_order(
-            &children,
+        let Partition { children, selected } = partition_index_run(
+            self.source,
+            &run,
+            bounds,
             self.max_points_per_node,
-            self.order_writer,
-            self.order_offset,
             self.cancel,
         )?;
-        let selected_total = selected_counts.iter().sum();
+        drop(run);
+        for &(index, _) in &selected {
+            append_index_to_order(self.order_writer, self.order_offset, index)?;
+        }
         self.nodes.push(LodNodeRange {
             key,
             start,
-            count: selected_total,
+            count: selected.len(),
         });
 
-        for (octant, child) in children.iter_mut().enumerate() {
-            let Some(mut child_run) = child.take() else {
+        // `selected` is sorted by index, so each per-octant list is too.
+        let mut excludes: [_; 8] = std::array::from_fn(|_| Vec::new());
+        for (index, octant) in selected {
+            excludes[usize::from(octant)].push(index);
+        }
+        for (octant, (child, exclude)) in children.into_iter().zip(excludes).enumerate() {
+            let Some(mut child) = child else {
                 continue;
             };
-            let selected = selected_counts[octant];
-            if selected >= child_run.count {
+            child.exclude = exclude;
+            if child.len() == 0 {
                 continue;
             }
-            child_run.start += selected as u64 * INDEX_RECORD_BYTES;
-            child_run.count -= selected;
-            self.assign(
-                key.child(octant as u8)?,
-                child_run,
-                bounds.octant(octant as u8),
-            )?;
+            self.assign(key.child(octant as u8)?, child, bounds.octant(octant as u8))?;
         }
         Ok(())
     }
@@ -167,43 +216,48 @@ fn write_root_index_run(total_points: u32, cancel: &dyn CancelCheck) -> Result<I
         .map_err(|e| Error::io("flush root LOD index", e.into_error()))?;
     Ok(IndexRun {
         path: file.into_temp_path(),
-        start: 0,
-        count: total_points as usize,
+        records: total_points as usize,
+        exclude: Vec::new(),
     })
 }
 
+struct Partition {
+    children: [Option<IndexRun>; 8],
+    /// Representatives kept by the parent node as `(index, octant)`, sorted
+    /// by index.
+    selected: Vec<(u32, u8)>,
+}
+
+/// Split a run into its eight child octants while choosing the parent's
+/// representative points in the same pass.
 fn partition_index_run<S: CopcPointSource>(
     source: &S,
     run: &IndexRun,
     bounds: Bounds,
+    max_points_per_node: usize,
     cancel: &dyn CancelCheck,
-) -> Result<[Option<IndexRun>; 8]> {
-    let mut reader = open_index_run(run)?;
+) -> Result<Partition> {
     let mut writers: [Option<BufWriter<NamedTempFile>>; 8] = std::array::from_fn(|_| None);
     let mut counts = [0usize; 8];
     let center = bounds.center();
-    for read_index in 0..run.count {
-        if read_index.is_multiple_of(CANCEL_POLL_STRIDE) {
-            cancel.check()?;
-        }
-        let index = reader
-            .read_u32::<LittleEndian>()
-            .map_err(|e| Error::io("read LOD partition index", e))?;
+    let mut sampler = GridSampler::new(bounds, max_points_per_node);
+    run.for_each(cancel, |index| {
         let (x, y, z) = source.xyz(index as usize)?;
         let octant = child_octant(center, x, y, z);
-        if writers[octant].is_none() {
-            writers[octant] = Some(BufWriter::with_capacity(
+        let writer = match &mut writers[octant] {
+            Some(writer) => writer,
+            empty => empty.insert(BufWriter::with_capacity(
                 INDEX_IO_BUFFER_BYTES,
                 new_index_tempfile("partition")?,
-            ));
-        }
-        writers[octant]
-            .as_mut()
-            .ok_or_else(|| Error::InvalidData("partition writer was not created".into()))?
+            )),
+        };
+        writer
             .write_u32::<LittleEndian>(index)
             .map_err(|e| Error::io("write LOD partition index", e))?;
         counts[octant] += 1;
-    }
+        sampler.offer(index, octant as u8, (x, y, z));
+        Ok(())
+    })?;
 
     let mut children: [Option<IndexRun>; 8] = std::array::from_fn(|_| None);
     for octant in 0..8 {
@@ -215,76 +269,110 @@ fn partition_index_run<S: CopcPointSource>(
             .map_err(|e| Error::io("flush LOD partition index", e.into_error()))?;
         children[octant] = Some(IndexRun {
             path: file.into_temp_path(),
-            start: 0,
-            count: counts[octant],
+            records: counts[octant],
+            exclude: Vec::new(),
         });
     }
-    Ok(children)
+    Ok(Partition {
+        children,
+        selected: sampler.into_selection(),
+    })
 }
 
-fn append_lod_selection_to_order<W: Write>(
-    children: &[Option<IndexRun>; 8],
-    max_points_per_node: usize,
-    order_writer: &mut W,
-    order_offset: &mut u64,
-    cancel: &dyn CancelCheck,
-) -> Result<[usize; 8]> {
-    let mut readers: [Option<BufReader<File>>; 8] = std::array::from_fn(|_| None);
-    for octant in 0..8 {
-        if let Some(child) = &children[octant] {
-            readers[octant] = Some(open_index_run(child)?);
-        }
-    }
-
-    let mut selected_counts = [0usize; 8];
-    let mut selected_total = 0usize;
-    while selected_total < max_points_per_node {
-        cancel.check()?;
-        let mut progressed = false;
-        for octant in 0..8 {
-            let Some(child) = &children[octant] else {
-                continue;
-            };
-            if selected_counts[octant] >= child.count {
-                continue;
-            }
-            let index = readers[octant]
-                .as_mut()
-                .ok_or_else(|| Error::InvalidData("partition reader was not opened".into()))?
-                .read_u32::<LittleEndian>()
-                .map_err(|e| Error::io("read selected LOD index", e))?;
-            append_index_to_order(order_writer, order_offset, index)?;
-            selected_counts[octant] += 1;
-            selected_total += 1;
-            progressed = true;
-            if selected_total == max_points_per_node {
-                break;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    Ok(selected_counts)
+/// Chooses an interior node's representative points: the first point seen in
+/// each occupied cell of the finest power-of-two voxel grid over the node
+/// whose occupied-cell count fits the node's point budget. Selecting by
+/// occupied cell rather than by input order spreads every LOD level evenly
+/// over the node, regardless of how the source points are ordered.
+struct GridSampler {
+    min: (f64, f64, f64),
+    cells_per_unit: (f64, f64, f64),
+    budget: usize,
+    /// `levels[k]` maps each occupied cell of the `2^k`-per-axis grid to its
+    /// representative `(index, octant)`. Levels whose occupancy exceeds the
+    /// budget are dropped, so the last level is always the finest that fits.
+    levels: Vec<HashMap<u32, (u32, u8), BuildHasherDefault<CellHasher>>>,
 }
 
-fn append_index_run_to_order<W: Write>(
-    run: &IndexRun,
-    order_writer: &mut W,
-    order_offset: &mut u64,
-    cancel: &dyn CancelCheck,
-) -> Result<()> {
-    let mut reader = open_index_run(run)?;
-    for read_index in 0..run.count {
-        if read_index.is_multiple_of(CANCEL_POLL_STRIDE) {
-            cancel.check()?;
+impl GridSampler {
+    fn new(bounds: Bounds, budget: usize) -> Self {
+        let cells = f64::from(1u32 << LOD_GRID_MAX_LEVEL);
+        Self {
+            min: bounds.min,
+            cells_per_unit: (
+                cells / (bounds.max.0 - bounds.min.0),
+                cells / (bounds.max.1 - bounds.min.1),
+                cells / (bounds.max.2 - bounds.min.2),
+            ),
+            budget: budget.max(1),
+            levels: (0..=LOD_GRID_MAX_LEVEL)
+                .map(|_| HashMap::default())
+                .collect(),
         }
-        let index = reader
-            .read_u32::<LittleEndian>()
-            .map_err(|e| Error::io("read LOD index", e))?;
-        append_index_to_order(order_writer, order_offset, index)?;
     }
-    Ok(())
+
+    fn offer(&mut self, index: u32, octant: u8, (x, y, z): (f64, f64, f64)) {
+        let max_cell = (1u32 << LOD_GRID_MAX_LEVEL) - 1;
+        // Float-to-int casts saturate (NaN maps to 0), so edge points clamp
+        // into the outermost cells.
+        let cell =
+            |value: f64, min: f64, per_unit: f64| (((value - min) * per_unit) as u32).min(max_cell);
+        let cx = cell(x, self.min.0, self.cells_per_unit.0);
+        let cy = cell(y, self.min.1, self.cells_per_unit.1);
+        let cz = cell(z, self.min.2, self.cells_per_unit.2);
+        // An occupied cell implies its coarser ancestors are occupied, so
+        // stop at the first level that already has a representative.
+        for (level, cells) in self.levels.iter_mut().enumerate().rev() {
+            let shift = LOD_GRID_MAX_LEVEL - level as u32;
+            let key = ((cx >> shift) << (2 * LOD_GRID_MAX_LEVEL))
+                | ((cy >> shift) << LOD_GRID_MAX_LEVEL)
+                | (cz >> shift);
+            match cells.entry(key) {
+                Entry::Occupied(_) => break,
+                Entry::Vacant(cell) => {
+                    cell.insert((index, octant));
+                }
+            }
+        }
+        while self.levels.len() > 1 && self.levels.last().map_or(0, HashMap::len) > self.budget {
+            self.levels.pop();
+        }
+    }
+
+    fn into_selection(mut self) -> Vec<(u32, u8)> {
+        let mut selected: Vec<_> = self
+            .levels
+            .pop()
+            .unwrap_or_default()
+            .into_values()
+            .collect();
+        selected.sort_unstable_by_key(|&(index, _)| index);
+        selected
+    }
+}
+
+/// Hasher for packed grid-cell keys: a splitmix64 finalizer, which is much
+/// cheaper than SipHash and spreads the structured keys across buckets.
+#[derive(Default)]
+struct CellHasher(u64);
+
+impl Hasher for CellHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value);
+    }
+
+    fn finish(&self) -> u64 {
+        let mut z = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
 }
 
 fn append_index_to_order<W: Write>(
@@ -299,14 +387,6 @@ fn append_index_to_order<W: Write>(
         .checked_add(INDEX_RECORD_BYTES)
         .ok_or_else(|| Error::InvalidInput("LOD index order exceeds u64 range".into()))?;
     Ok(())
-}
-
-fn open_index_run(run: &IndexRun) -> Result<BufReader<File>> {
-    let path: &Path = run.path.as_ref();
-    let mut file = File::open(path).map_err(|e| Error::io("open LOD index", e))?;
-    file.seek(SeekFrom::Start(run.start))
-        .map_err(|e| Error::io("seek LOD index", e))?;
-    Ok(BufReader::with_capacity(INDEX_IO_BUFFER_BYTES, file))
 }
 
 fn new_index_tempfile(label: &str) -> Result<NamedTempFile> {
@@ -340,6 +420,8 @@ pub(crate) fn cube_from_bounds(bounds: &Bounds) -> ((f64, f64, f64), f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::{Seek, SeekFrom};
 
     use copc_core::NeverCancel;
 
@@ -481,6 +563,43 @@ mod tests {
                 indices.len(),
             );
         }
+    }
+
+    #[test]
+    fn interior_nodes_cover_the_whole_node_for_scan_ordered_input() {
+        // Row-major input is the worst case for input-order selection: the
+        // first points of each octant are a thin strip along its bottom edge.
+        let side = 100u32;
+        let points = (0..side * side)
+            .map(|i| CopcPointFields {
+                x: f64::from(i % side),
+                y: f64::from(i / side),
+                return_number: 1,
+                number_of_returns: 1,
+                ..CopcPointFields::default()
+            })
+            .collect();
+        let source = VecSource { points };
+        let bounds = source_bounds(&source);
+        let (center, halfsize) = cube_from_bounds(&bounds);
+        let params = CopcWriterParams::new(500);
+
+        let lod = build_lod_index(&source, center, halfsize, &params, &NeverCancel).unwrap();
+        let ranges = read_lod_index(&lod).unwrap();
+        let (key, root) = &ranges[0];
+        assert_eq!(VoxelKey::root(), *key);
+        assert!(root.len() <= 500);
+
+        let mut coarse_cells = std::collections::HashSet::new();
+        for &index in root {
+            let point = &source.points[index as usize];
+            coarse_cells.insert(((point.x / 10.0) as u32, (point.y / 10.0) as u32));
+        }
+        assert_eq!(
+            100,
+            coarse_cells.len(),
+            "root representatives must touch every 10x10 cell of the cloud"
+        );
     }
 
     #[test]
