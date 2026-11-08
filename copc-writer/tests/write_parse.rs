@@ -147,6 +147,7 @@ fn writer_output_parses_with_reader_hierarchy() {
             red: 0,
             green: 0,
             blue: 0,
+            nir: 0,
             extra_bytes: Vec::new(),
         });
     }
@@ -243,6 +244,7 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
             red: 1000,
             green: 2000,
             blue: 3000,
+            nir: 0,
             extra_bytes: Vec::new(),
         },
         CopcPointFields {
@@ -267,6 +269,7 @@ fn writer_round_trips_fields_through_copc_and_las_readers() {
             red: 4000,
             green: 5000,
             blue: 6000,
+            nir: 0,
             extra_bytes: Vec::new(),
         },
     ];
@@ -688,41 +691,48 @@ fn streaming_conversion_preserves_extra_point_bytes_and_descriptor() {
 }
 
 #[test]
-fn streaming_conversion_rejects_unsupported_point_dimensions() {
+fn streaming_conversion_preserves_nir_as_point_format_8() {
     let dir = tempfile::tempdir().unwrap();
-    let las_path = dir.path().join("unsupported-dimensions.las");
-    let copc_path = dir.path().join("unsupported-dimensions.copc.laz");
+    let las_path = dir.path().join("nir.las");
+    let copc_path = dir.path().join("nir.copc.laz");
     let spill_dir = dir.path().join("spill");
     std::fs::create_dir(&spill_dir).unwrap();
 
     let mut builder = las::Builder::from((1, 4));
     builder.point_format = las::point::Format::new(8).unwrap();
     let mut writer = las::Writer::from_path(&las_path, builder.into_header().unwrap()).unwrap();
-    writer
-        .write_point(las::Point {
-            x: 1.0,
-            y: 2.0,
-            z: 3.0,
+    let expected: Vec<las::Point> = (0..300u16)
+        .map(|i| las::Point {
+            x: f64::from(i % 20),
+            y: f64::from(i / 20),
+            z: f64::from(i % 7),
             return_number: 1,
             number_of_returns: 1,
-            gps_time: Some(1.0),
-            color: Some(Color::new(1, 2, 3)),
-            nir: Some(4),
+            gps_time: Some(f64::from(i)),
+            color: Some(Color::new(i, i * 2, i * 3)),
+            nir: Some(60_000 - i),
             ..Default::default()
         })
-        .unwrap();
+        .collect();
+    for point in &expected {
+        writer.write_point(point.clone()).unwrap();
+    }
     writer.close().unwrap();
 
-    let err = convert_las_to_copc_streaming(
+    convert_las_to_copc_streaming(
         &las_path,
         &copc_path,
-        &CopcWriterParams::default(),
+        &CopcWriterParams::new(64),
         &spill_dir,
         &NeverCancel,
     )
-    .unwrap_err();
-    let message = err.to_string();
-    assert!(message.contains("NIR point data"));
+    .unwrap();
+
+    let mut reader = las::Reader::from_path(&copc_path).unwrap();
+    assert_eq!(8, reader.header().point_format().to_u8().unwrap());
+    let mut actual = read_all_las_points(&mut reader);
+    actual.sort_by(|a, b| a.gps_time.unwrap().total_cmp(&b.gps_time.unwrap()));
+    assert_las_points_match_points(&expected, &actual);
 }
 
 #[test]
@@ -1325,9 +1335,28 @@ fn streaming_writer_rejects_unsupported_layout_dimensions() {
     )
     .unwrap_err();
 
-    let message = err.to_string();
-    assert!(message.contains("NIR point data"));
-    assert!(message.contains("waveform point data"));
+    assert!(err.to_string().contains("waveform point data"));
+
+    let nir_without_rgb = StreamingLayout {
+        point_format: 8,
+        has_gps: true,
+        has_color: false,
+        has_nir: true,
+        has_waveform: false,
+        extra_bytes: 0,
+        extra_bytes_descriptors: Vec::new(),
+    };
+    let err = write_streaming_with_cancel(
+        &path,
+        nir_without_rgb,
+        std::iter::empty::<copc_core::Result<copc_core::LasPointRecord>>(),
+        &CopcWriterParams::default(),
+        &CopcWriteMetadata::default(),
+        &spill_dir,
+        &NeverCancel,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("requires RGB"));
 }
 
 #[test]
@@ -1723,6 +1752,7 @@ fn point_fields(x: f64, y: f64, z: f64) -> CopcPointFields {
         red: 0,
         green: 0,
         blue: 0,
+        nir: 0,
         extra_bytes: Vec::new(),
     }
 }

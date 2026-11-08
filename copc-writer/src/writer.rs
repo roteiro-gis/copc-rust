@@ -260,7 +260,18 @@ fn write_copc_inner<S: CopcPointSource>(
             "max_points_per_node must be greater than zero".into(),
         ));
     }
-    let point_format_id = if has_color { 7u8 } else { 6u8 };
+    let point_format_id = if source.has_nir() {
+        if !has_color {
+            return Err(Error::InvalidInput(
+                "NIR point data requires RGB (LAS point format 8)".into(),
+            ));
+        }
+        8u8
+    } else if has_color {
+        7
+    } else {
+        6
+    };
     let mut point_format =
         LasFormat::new(point_format_id).map_err(|e| Error::Las(format!("point format: {e}")))?;
     let extra_byte_count = source.extra_byte_count();
@@ -848,7 +859,7 @@ fn compress_standalone_chunk(raw_points: &[u8], var_vlr: &laz::LazVlr) -> Result
     Ok(bytes[8..table_position].to_vec())
 }
 
-/// Encode one point directly into the PDRF 6/7 record layout, avoiding the
+/// Encode one point directly into the PDRF 6/7/8 record layout, avoiding the
 /// per-point `las::raw::Point` construction (and its `extra_bytes` clone) in
 /// the hot compression loop.
 fn encode_point_record(
@@ -859,7 +870,7 @@ fn encode_point_record(
     point_index: usize,
     format: &LasFormat,
 ) -> Result<()> {
-    debug_assert!(format.is_extended && !format.has_nir && !format.has_waveform);
+    debug_assert!(format.is_extended && !format.has_waveform);
     debug_assert_eq!(usize::from(format.len()), buf.len());
     let (ix, iy, iz) = quantize_xyz(point_index, fields.x, fields.y, fields.z, scale, offset)?;
     buf[0..4].copy_from_slice(&ix.to_le_bytes());
@@ -886,6 +897,10 @@ fn encode_point_record(
         buf[34..36].copy_from_slice(&fields.blue.to_le_bytes());
         cursor = 36;
     }
+    if format.has_nir {
+        buf[cursor..cursor + 2].copy_from_slice(&fields.nir.to_le_bytes());
+        cursor += 2;
+    }
     if fields.extra_bytes.len() != buf.len() - cursor {
         return Err(Error::InvalidInput(format!(
             "point {point_index} has {} extra byte(s), expected {}",
@@ -904,7 +919,7 @@ mod tests {
     use las::{raw, Color};
 
     /// The direct encoder must stay byte-identical to `las::raw::Point`
-    /// serialization for the PDRF 6/7 layouts the writer emits.
+    /// serialization for the PDRF 6/7/8 layouts the writer emits.
     #[test]
     fn direct_point_encoding_matches_las_raw_point() {
         let fields = CopcPointFields {
@@ -929,12 +944,13 @@ mod tests {
             red: 1_000,
             green: 2_000,
             blue: 3_000,
+            nir: 4_000,
             extra_bytes: Vec::new(),
         };
         let scale = (0.001, 0.001, 0.001);
         let offset = (0.0, 0.0, 0.0);
 
-        for (format_id, extra_bytes) in [(6u8, 0u16), (6, 3), (7, 0), (7, 5)] {
+        for (format_id, extra_bytes) in [(6u8, 0u16), (6, 3), (7, 0), (7, 5), (8, 0), (8, 2)] {
             let mut format = LasFormat::new(format_id).unwrap();
             format.extra_bytes = extra_bytes;
             let mut fields = fields.clone();
@@ -974,7 +990,7 @@ mod tests {
                     fields.blue,
                 )),
                 waveform: None,
-                nir: None,
+                nir: format.has_nir.then_some(fields.nir),
                 extra_bytes: fields.extra_bytes.clone(),
             };
             let mut reference = Vec::with_capacity(usize::from(format.len()));

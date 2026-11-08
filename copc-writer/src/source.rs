@@ -31,6 +31,9 @@ pub struct CopcPointFields {
     pub red: u16,
     pub green: u16,
     pub blue: u16,
+    /// Near-infrared; written only when the source reports
+    /// [`CopcPointSource::has_nir`].
+    pub nir: u16,
     pub extra_bytes: Vec<u8>,
 }
 
@@ -47,6 +50,11 @@ pub trait CopcPointSource {
     }
     fn extra_bytes_vlrs(&self) -> &[las::Vlr] {
         &[]
+    }
+    /// Whether points carry near-infrared values. NIR output uses LAS point
+    /// format 8, which also requires RGB.
+    fn has_nir(&self) -> bool {
+        false
     }
 
     fn is_empty(&self) -> bool {
@@ -78,6 +86,7 @@ pub struct ColumnBatchSource<'a> {
     red: Option<&'a [u16]>,
     green: Option<&'a [u16]>,
     blue: Option<&'a [u16]>,
+    nir: Option<&'a [u16]>,
     extra_bytes: Option<(&'a [u8], usize)>,
 }
 
@@ -92,8 +101,14 @@ impl<'a> ColumnBatchSource<'a> {
         let red = optional_u16_column(batch, LasDimension::Red)?;
         let green = optional_u16_column(batch, LasDimension::Green)?;
         let blue = optional_u16_column(batch, LasDimension::Blue)?;
+        let nir = optional_u16_column(batch, LasDimension::Nir)?;
         let extra_bytes = optional_extra_bytes_column(batch)?;
         validate_color_columns(red, green, blue)?;
+        if nir.is_some() && red.is_none() {
+            return Err(Error::InvalidInput(
+                "Nir column requires Red, Green, and Blue columns (LAS point format 8)".into(),
+            ));
+        }
 
         Ok(Self {
             batch,
@@ -118,6 +133,7 @@ impl<'a> ColumnBatchSource<'a> {
             red,
             green,
             blue,
+            nir,
             extra_bytes,
         })
     }
@@ -165,6 +181,12 @@ impl CopcPointSource for ColumnBatchSource<'_> {
     }
 
     fn fields_into(&self, index: usize, out: &mut CopcPointFields) -> Result<()> {
+        if index >= self.len() {
+            return Err(Error::InvalidInput(format!(
+                "column batch index {index} out of range (len {})",
+                self.len()
+            )));
+        }
         out.x = self.x[index];
         out.y = self.y[index];
         out.z = self.z[index];
@@ -186,6 +208,7 @@ impl CopcPointSource for ColumnBatchSource<'_> {
         out.red = at_u16(self.red, index);
         out.green = at_u16(self.green, index);
         out.blue = at_u16(self.blue, index);
+        out.nir = at_u16(self.nir, index);
         out.extra_bytes.clear();
         if let Some((values, width)) = self.extra_bytes {
             let start = index * width;
@@ -197,6 +220,10 @@ impl CopcPointSource for ColumnBatchSource<'_> {
 
     fn extra_byte_count(&self) -> u16 {
         self.extra_byte_width() as u16
+    }
+
+    fn has_nir(&self) -> bool {
+        self.nir.is_some()
     }
 }
 
@@ -217,7 +244,6 @@ fn validate_column_batch_writer_support(batch: &LasColumnBatch) -> Result<()> {
         .columns
         .iter()
         .filter_map(|(spec, _)| match spec.dimension {
-            LasDimension::Nir => Some("NIR point data"),
             LasDimension::WaveformPacketDescriptorIndex
             | LasDimension::WaveformPacketByteOffset
             | LasDimension::WaveformPacketSize
@@ -393,6 +419,7 @@ impl CopcPointSource for SpillSource<'_> {
         out.red = record.red;
         out.green = record.green;
         out.blue = record.blue;
+        out.nir = record.nir;
         out.extra_bytes.clear();
         out.extra_bytes.extend_from_slice(&record.extra_bytes);
         Ok(())
@@ -404,5 +431,9 @@ impl CopcPointSource for SpillSource<'_> {
 
     fn extra_bytes_vlrs(&self) -> &[las::Vlr] {
         &self.reader.layout().extra_bytes_descriptors
+    }
+
+    fn has_nir(&self) -> bool {
+        self.reader.layout().has_nir
     }
 }

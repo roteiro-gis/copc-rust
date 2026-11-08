@@ -29,7 +29,7 @@ const MAX_SOURCE_EVLR_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 /// Defaults produce a conformant file: current UTC creation date, `copc-rust`
 /// identifiers, millimeter scale, offsets derived from the write bounds, and
 /// an empty WKT CRS record (LAS 1.4 requires the WKT global-encoding bit for
-/// point formats 6 and 7).
+/// point formats 6-8).
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct CopcWriteMetadata {
