@@ -73,14 +73,17 @@ fn read_columns_matches_synthetic_copc_rows() {
             .collect::<Vec<_>>()
             .as_slice()
     );
+    // `las::Point` folds legacy class 12 into 1, so check classification
+    // against the source values, keyed by each row's unique GPS time.
     assert_eq!(
         column_u8(&all_columns, LasDimension::Classification),
         all_points
             .iter()
-            .map(|point| u8::from(point.classification))
+            .map(|point| source.points[grid_index(point)].classification)
             .collect::<Vec<_>>()
             .as_slice()
     );
+    assert!(column_u8(&all_columns, LasDimension::Classification).contains(&12));
     assert_eq!(
         column_u16(&all_columns, LasDimension::Intensity),
         all_points
@@ -265,7 +268,7 @@ fn single_dimension_reads_match_rows() {
             let single = read_columns(&path, query, ColumnSelection::from_dimensions([dimension]));
             assert_eq!(rows.len(), single.len(), "{dimension:?}");
             assert_eq!(
-                Some(&expected_column(dimension, &rows)),
+                Some(&expected_column(dimension, &rows, &source.0.points)),
                 single.column(dimension),
                 "{dimension:?} single-dimension read differs from rows for {query:?}"
             );
@@ -273,7 +276,17 @@ fn single_dimension_reads_match_rows() {
     }
 }
 
-fn expected_column(dimension: LasDimension, rows: &[las::Point]) -> ColumnData {
+/// Index of the `grid_points` source point a row came from, recovered from
+/// its unique GPS time.
+fn grid_index(point: &las::Point) -> usize {
+    ((point.gps_time.unwrap() - 1.0e9) / 0.25).round() as usize
+}
+
+fn expected_column(
+    dimension: LasDimension,
+    rows: &[las::Point],
+    source: &[CopcPointFields],
+) -> ColumnData {
     let f64s = |value: fn(&las::Point) -> f64| ColumnData::F64(rows.iter().map(value).collect());
     let u16s = |value: fn(&las::Point) -> u16| ColumnData::U16(rows.iter().map(value).collect());
     let u8s = |value: fn(&las::Point) -> u8| ColumnData::U8(rows.iter().map(value).collect());
@@ -285,7 +298,13 @@ fn expected_column(dimension: LasDimension, rows: &[las::Point]) -> ColumnData {
         LasDimension::Intensity => u16s(|p| p.intensity),
         LasDimension::ReturnNumber => u8s(|p| p.return_number),
         LasDimension::NumberOfReturns => u8s(|p| p.number_of_returns),
-        LasDimension::Classification => u8s(|p| u8::from(p.classification)),
+        // `las::Point` folds legacy class 12 into 1; columns report the
+        // stored byte.
+        LasDimension::Classification => ColumnData::U8(
+            rows.iter()
+                .map(|p| source[grid_index(p)].classification)
+                .collect(),
+        ),
         LasDimension::ScanDirectionFlag => {
             bools(|p| matches!(p.scan_direction, las::point::ScanDirection::LeftToRight))
         }

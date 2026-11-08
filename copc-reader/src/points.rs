@@ -519,9 +519,6 @@ fn empty_column(spec: ColumnSpec, capacity: usize) -> Result<(ColumnSpec, Column
 /// Reader-side scan angle scale, matching `las::raw::point::ScanAngle`'s
 /// scaled-to-degrees conversion for LAS 1.4 extended formats.
 const LAS_14_SCAN_ANGLE_SCALE: f32 = 0.006;
-/// Overlap classification code; extended points with this class are reported
-/// as `Overlap = true`, `Classification = 1`, matching `las::raw::point::Flags`.
-const OVERLAP_CLASSIFICATION_CODE: u8 = 12;
 
 /// Field offsets within an extended (PDRF 6-10) point record, so columns can
 /// be filled directly from the decompressed record bytes without building a
@@ -582,18 +579,7 @@ fn append_columns(
     layout: &ExtendedPointLayout,
     xyz: (f64, f64, f64),
 ) -> Result<()> {
-    let raw_class = buf[16];
-    let context = ColumnAppendContext {
-        buf,
-        layout,
-        xyz,
-        classification: if raw_class == OVERLAP_CLASSIFICATION_CODE {
-            1
-        } else {
-            raw_class
-        },
-        is_overlap: buf[15] & 8 == 8,
-    };
+    let context = ColumnAppendContext { buf, layout, xyz };
 
     for (spec, data) in columns {
         append_column(*spec, data, &context)?;
@@ -605,8 +591,6 @@ struct ColumnAppendContext<'a> {
     buf: &'a [u8],
     layout: &'a ExtendedPointLayout,
     xyz: (f64, f64, f64),
-    classification: u8,
-    is_overlap: bool,
 }
 
 #[inline]
@@ -666,8 +650,11 @@ fn append_column(
         (LasDimension::NumberOfReturns, ColumnData::U8(values)) => {
             values.push((buf[14] >> 4) & 15);
         }
+        // PDRF 6-10 carry overlap as a flag bit, so the classification byte
+        // is reported as stored. (`las::Point` still maps legacy class 12 to
+        // 1 for row reads.)
         (LasDimension::Classification, ColumnData::U8(values)) => {
-            values.push(context.classification);
+            values.push(buf[16]);
         }
         (LasDimension::ScanDirectionFlag, ColumnData::Bool(values)) => {
             values.push((buf[15] >> 6) & 1 == 1);
@@ -693,7 +680,7 @@ fn append_column(
         (LasDimension::Withheld, ColumnData::Bool(values)) => {
             values.push(buf[15] & 4 == 4);
         }
-        (LasDimension::Overlap, ColumnData::Bool(values)) => values.push(context.is_overlap),
+        (LasDimension::Overlap, ColumnData::Bool(values)) => values.push(buf[15] & 8 == 8),
         (LasDimension::ScanChannel, ColumnData::U8(values)) => {
             values.push((buf[15] >> 4) & 3);
         }
@@ -1292,6 +1279,35 @@ mod tests {
         assert!(err.to_string().contains("expected 3"));
     }
 
+    #[test]
+    fn classification_twelve_is_reported_as_stored() {
+        let format = LasPointFormat::new(6).unwrap();
+        let raw_point = las::raw::Point {
+            flags: las::raw::point::Flags::ThreeByte(1 | (1 << 4), 0, 12),
+            ..Default::default()
+        };
+        let buf = record_bytes(&format, &raw_point);
+        let layout = ExtendedPointLayout::for_format(&format).unwrap();
+        let mut columns = selected_column_builders(
+            format,
+            ColumnSelection::from_dimensions([LasDimension::Classification, LasDimension::Overlap]),
+            1,
+        )
+        .unwrap();
+
+        append_columns(&mut columns, &buf, &layout, (0.0, 0.0, 0.0)).unwrap();
+        let batch = LasColumnBatch::new(columns).unwrap();
+
+        assert_eq!(
+            Some(&ColumnData::U8(vec![12])),
+            batch.column(LasDimension::Classification)
+        );
+        assert_eq!(
+            Some(&ColumnData::Bool(vec![false])),
+            batch.column(LasDimension::Overlap)
+        );
+    }
+
     /// Every column decoded directly from record bytes must match the values
     /// the `las` crate parses from the same bytes.
     #[test]
@@ -1327,9 +1343,7 @@ mod tests {
             append_columns(&mut columns, &buf, &layout, (1.0, 2.0, 3.0)).unwrap();
             let batch = LasColumnBatch::new(columns).unwrap();
 
-            let mut flags = raw_point.flags;
-            let expected_overlap = flags.is_overlap();
-            flags.clear_overlap_class();
+            let flags = raw_point.flags;
             assert_eq!(
                 Some(&ColumnData::U16(vec![raw_point.intensity])),
                 batch.column(LasDimension::Intensity)
@@ -1384,7 +1398,7 @@ mod tests {
                 batch.column(LasDimension::Withheld)
             );
             assert_eq!(
-                Some(&ColumnData::Bool(vec![expected_overlap])),
+                Some(&ColumnData::Bool(vec![flags.is_overlap()])),
                 batch.column(LasDimension::Overlap)
             );
             assert_eq!(
